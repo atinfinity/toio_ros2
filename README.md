@@ -1,2 +1,60 @@
 # toio_ros2
-toio_ros2 is ROS 2 package for using toio.
+
+## Introduction
+
+`toio_ros2` is ROS 2 package for using [toio](https://toio.io/).
+
+![](image/toio_ros2_rviz2.png)
+
+## Requirements
+
+I checked this package on the following environment.
+
+- Ubuntu 24.04
+- ROS 2 Jazzy
+- toio.py 1.10.0
+
+## Specification of toio_ros2
+
+### Subscribed topics
+
+|topic name|Type|Description|
+|---|---|---|
+|/cmd_vel|`geometry_msgs/msg/Twist`|desired robot velocity|
+
+### Published topics
+
+|topic name|Type|Description|
+|---|---|---|
+|/toio/pose|`geometry_msgs/msg/PoseStamped`|toio pose in map frame|
+|/toio/battery_level|`std_msgs/msg/Float32`|battery level of toio|
+|/tf|-|a valid transform from `map` to `center`|
+
+## Build
+
+```bash
+mkdir -p ~/dev_ws/src
+cd ~/dev_ws/src
+git clone https://github.com/atinfinity/toio_description.git
+git clone https://github.com/atinfinity/toio_ros2.git
+cd ..
+rosdep install -y -i --from-paths src
+colcon build --symlink-install
+source ~/dev_ws/install/setup.bash
+```
+
+## Launch toio_ros2
+
+```bash
+ros2 launch toio_ros2 toio_ros2_bringup.launch.py
+```
+
+## Teleop
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p speed:=0.1 -p turn:=3.0
+```
+
+## Frame
+
+![](image/frames.png)
