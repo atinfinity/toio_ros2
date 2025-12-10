@@ -31,6 +31,7 @@ class ToioNode(Node):
         # https://toio.github.io/toio-spec/en/docs/hardware_shape
         self.wheel_base = 0.0266 # meter
         self.wheel_radius = 0.00625 # meter
+        self.cube_height = 0.0256 # meter
 
         # https://toio.github.io/toio-spec/en/docs/ble_motor
         self.max_rpm = 494.0
@@ -46,7 +47,7 @@ class ToioNode(Node):
         self.field_height_meter = 0.210
         self.scale_x = self.field_width_meter / (self.field_max_x - self.field_min_x)
         self.scale_y = self.field_height_meter / (self.field_max_y - self.field_min_y)
-        self.get_logger().info(f"scale_x = {self.scale_x}, scale_y = {self.scale_y}")
+        self.get_logger().debug(f"scale_x = {self.scale_x}, scale_y = {self.scale_y}")
 
         # subscriber
         self.cmd_vel_sub = self.create_subscription(
@@ -98,7 +99,7 @@ class ToioNode(Node):
         # clip
         rpm_l = max(min(rpm_l,  self.max_rpm), -self.max_rpm)
         rpm_r = max(min(rpm_r,  self.max_rpm), -self.max_rpm)
-        self.get_logger().info(f"rpm_l = {rpm_l}, rpm_r = {rpm_r}")
+        self.get_logger().debug(f"rpm_l = {rpm_l}, rpm_r = {rpm_r}")
 
         # RPM -> toio motor_speed
         left_motor_speed = int((rpm_l / self.max_rpm) * self.max_input_speed)
@@ -119,43 +120,54 @@ class ToioNode(Node):
             self.get_cube_location(),
             self.loop)
         result = future.result()
-        self.get_logger().info(f'get_cube_location(), result = {result}')
+        self.get_logger().debug(f'get_cube_location(), result = {result}')
 
-        # convert ROS 2 coordinate
         if result[0] and result[1]:
-            pos = result[0]
-            pos_x = float(pos[0] - self.field_min_x) * self.scale_x
-            pos_y = -float(pos[1] - self.field_min_y) * self.scale_y
-            yaw_deg = 360.0 - float(result[1]) # deg
-            yaw_rad = math.radians(yaw_deg)
-            q_x, q_y, q_z, q_w  = quaternion_from_euler(0.0, 0.0, yaw_rad)
+            # convert ROS 2 coordinate
+            pos_x, pos_y, q_x, q_y, q_z, q_w = self.convert_toio_to_ros_coord(result[0][0], result[0][1], result[1])
 
-            pose_stamped_msg = PoseStamped()
-            pose_stamped_msg.header.stamp = self.get_clock().now().to_msg()
-            pose_stamped_msg.header.frame_id = 'map'
-            pose_stamped_msg.pose.position.x = pos_x
-            pose_stamped_msg.pose.position.y = pos_y
-            pose_stamped_msg.pose.position.z = 0.0128
-            pose_stamped_msg.pose.orientation.x = q_x
-            pose_stamped_msg.pose.orientation.y = q_y
-            pose_stamped_msg.pose.orientation.z = q_z
-            pose_stamped_msg.pose.orientation.w = q_w
-            self.toio_pose_pub.publish(pose_stamped_msg)
-            self.get_logger().info(f'pose_stamped_msg = {pose_stamped_msg}')
+            # publish PoseStamped
+            toio_pose_stamped_msg = self.make_pose_stamped_msg(pos_x, pos_y, q_x, q_y, q_z, q_w)
+            self.toio_pose_pub.publish(toio_pose_stamped_msg)
 
             # send the transformation
-            transform = TransformStamped()
-            transform.header.stamp = self.get_clock().now().to_msg()
-            transform.header.frame_id = 'map'
-            transform.child_frame_id = 'center'
-            transform.transform.translation.x = pos_x
-            transform.transform.translation.y = pos_y
-            transform.transform.translation.z = 0.0
-            transform.transform.rotation.x = q_x
-            transform.transform.rotation.y = q_y
-            transform.transform.rotation.z = q_z
-            transform.transform.rotation.w = q_w
-            self.tf_broadcaster.sendTransform(transform)
+            toio_transform = self.make_toio_transform(pos_x, pos_y, q_x, q_y, q_z, q_w)
+            self.tf_broadcaster.sendTransform(toio_transform)
+
+    def convert_toio_to_ros_coord(self, x, y, angle):
+        pos_x = float(x - self.field_min_x) * self.scale_x
+        pos_y = -float(y - self.field_min_y) * self.scale_y
+        yaw_deg = 360.0 - float(angle) # deg
+        yaw_rad = math.radians(yaw_deg)
+        q_x, q_y, q_z, q_w = quaternion_from_euler(0.0, 0.0, yaw_rad)
+        return pos_x, pos_y, q_x, q_y, q_z, q_w
+
+    def make_pose_stamped_msg(self, x, y, q_x, q_y, q_z, q_w):
+        pose_stamped_msg = PoseStamped()
+        pose_stamped_msg.header.stamp = self.get_clock().now().to_msg()
+        pose_stamped_msg.header.frame_id = 'map'
+        pose_stamped_msg.pose.position.x = x
+        pose_stamped_msg.pose.position.y = y
+        pose_stamped_msg.pose.position.z = self.cube_height / 2.0
+        pose_stamped_msg.pose.orientation.x = q_x
+        pose_stamped_msg.pose.orientation.y = q_y
+        pose_stamped_msg.pose.orientation.z = q_z
+        pose_stamped_msg.pose.orientation.w = q_w
+        return pose_stamped_msg
+
+    def make_toio_transform(self, x, y, q_x, q_y, q_z, q_w):
+        transform = TransformStamped()
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.header.frame_id = 'map'
+        transform.child_frame_id = 'center'
+        transform.transform.translation.x = x
+        transform.transform.translation.y = y
+        transform.transform.translation.z = 0.0
+        transform.transform.rotation.x = q_x
+        transform.transform.rotation.y = q_y
+        transform.transform.rotation.z = q_z
+        transform.transform.rotation.w = q_w
+        return transform
 
     def monitor_battery_information_callback(self) -> None:
         if not self.is_connected:
@@ -169,7 +181,7 @@ class ToioNode(Node):
             battery_level_msg = Float32()
             battery_level_msg.data = float(result)
             self.toio_battery_level_pub.publish(battery_level_msg)
-            self.get_logger().info(f'get_battery_information(), result = {result}')
+            self.get_logger().debug(f'get_battery_information(), result = {result}')
 
     # async function
     async def connect_toio(self) -> None:
@@ -187,7 +199,7 @@ class ToioNode(Node):
         if hasattr(data, 'center') and hasattr(data.center, 'point') and hasattr(data.center, 'angle'):
             pos = (data.center.point.x, data.center.point.y)
             angle = data.center.angle
-            self.get_logger().info(f'pos = {pos}, angle = {angle}')
+            self.get_logger().debug(f'pos = {pos}, angle = {angle}')
             return pos, angle
         return None, None
 
@@ -195,7 +207,7 @@ class ToioNode(Node):
         data = await self.cube.api.battery.read()
         if hasattr(data, 'battery_level'):
             battery_level = data.battery_level
-            self.get_logger().info(f'battery_level = {battery_level}')
+            self.get_logger().debug(f'battery_level = {battery_level}')
             return battery_level
         return None
 

@@ -8,6 +8,14 @@
 
 ## Requirements
 
+### Hardware
+
+- toio Core Cube
+- toio play mat
+  - Please see <https://toio.github.io/toio-spec/en/docs/hardware_position_id>.
+
+### Software
+
 I checked this package on the following environment.
 
 - Ubuntu 24.04
