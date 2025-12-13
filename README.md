@@ -29,6 +29,7 @@ I checked this package on the following environment.
 |topic name|Type|Description|
 |---|---|---|
 |/cmd_vel|`geometry_msgs/msg/Twist`|desired robot velocity|
+|/goal_pose|`geometry_msgs/msg/PoseStamped`|desired robot pose|
 
 ### Published topics
 
