@@ -18,10 +18,11 @@ import math
 
 import rclpy
 from rclpy.node import Node
-from tf_transformations import quaternion_from_euler
+from tf_transformations import quaternion_from_euler, euler_from_quaternion
 from tf2_ros import TransformBroadcaster
 from std_msgs.msg import Float32
 from geometry_msgs.msg import Twist, PoseStamped, TransformStamped
+
 from toio import *
 
 
@@ -56,6 +57,12 @@ class ToioNode(Node):
             self.cmd_vel_callback,
             10)
         self.cmd_vel_sub
+        self.goal_pose_sub = self.create_subscription(
+            PoseStamped,
+            'goal_pose',
+            self.goal_pose_callback,
+            10)
+        self.goal_pose_sub
 
         # publisher
         self.toio_pose_pub = self.create_publisher(PoseStamped, 'toio/pose', qos_profile=10)
@@ -109,6 +116,22 @@ class ToioNode(Node):
             self.motor_control(left_motor_speed, right_motor_speed),
             self.loop)
 
+    def goal_pose_callback(self, msg: PoseStamped) -> None:
+        if not self.is_connected:
+            return
+
+        pos_x = msg.pose.position.x
+        pos_y = msg.pose.position.y
+        q_x = msg.pose.orientation.x
+        q_y = msg.pose.orientation.y
+        q_z = msg.pose.orientation.z
+        q_w = msg.pose.orientation.w
+        x, y, angle = self.convert_ros_to_toio_coord(pos_x, pos_y, q_x, q_y, q_z, q_w)
+        self.get_logger().info(f'goal_pose_callback() received, x = {x}, y = {y}, angle = {angle}')
+        asyncio.run_coroutine_threadsafe(
+            self.motor_control_target(x, y, angle),
+            self.loop)
+
     def linear_speed_to_rpm(self, v_lin: float) -> float:
         return (v_lin / (2.0 * math.pi * self.wheel_radius)) * 60.0
 
@@ -141,6 +164,16 @@ class ToioNode(Node):
         yaw_rad = math.radians(yaw_deg)
         q_x, q_y, q_z, q_w = quaternion_from_euler(0.0, 0.0, yaw_rad)
         return pos_x, pos_y, q_x, q_y, q_z, q_w
+
+    def convert_ros_to_toio_coord(self, pos_x, pos_y, q_x, q_y, q_z, q_w):
+        x = int((float(pos_x) / self.scale_x) + self.field_min_x)
+        y = int(-(pos_y / self.scale_y) + self.field_min_y)
+        _, _, yaw_rad = euler_from_quaternion([q_x, q_y, q_z, q_w])
+        yaw_deg = math.degrees(yaw_rad)
+        angle = int(360.0 - yaw_deg)
+        if angle > 360:
+            angle = angle - 360
+        return x, y, angle
 
     def make_pose_stamped_msg(self, x, y, q_x, q_y, q_z, q_w):
         pose_stamped_msg = PoseStamped()
@@ -193,6 +226,21 @@ class ToioNode(Node):
 
     async def motor_control(self, left_motor_speed, right_motor_speed) -> None:
         await self.cube.api.motor.motor_control(left_motor_speed, right_motor_speed, duration_ms=500)
+
+    async def motor_control_target(self, x, y, angle) -> None:
+        self.get_logger().debug(f'motor_control_target(): x = {x}, y={y}, angle = {angle}')
+        await self.cube.api.motor.motor_control_target(
+            timeout=60,
+            movement_type=MovementType.Linear,
+            speed=Speed(
+                max=30, speed_change_type=SpeedChangeType.AccelerationAndDeceleration),
+            target=TargetPosition(
+                cube_location=CubeLocation(point=Point(x=x, y=y), angle=angle),
+                rotation_option=RotationOption.AbsoluteOptimal,
+            ),
+        )
+
+        await asyncio.sleep(4)
 
     async def get_cube_location(self):
         data = await self.cube.api.id_information.read()
