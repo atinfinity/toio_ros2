@@ -39,13 +39,23 @@ class ToioNode(Node):
         self.max_input_speed = 115.0
         self.is_connected = False
 
-        # TODO: configuration via params
-        self.field_min_x = 98.0
-        self.field_max_x = 402.0
-        self.field_min_y = 142.0
-        self.field_max_y = 358.0
-        self.field_width_meter = 0.297
-        self.field_height_meter = 0.210
+        # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
+        self.declare_parameter('field_min_x', 98.0)
+        self.declare_parameter('field_max_x', 402.0)
+        self.declare_parameter('field_min_y', 142.0)
+        self.declare_parameter('field_max_y', 358.0)
+        self.declare_parameter('field_width_meter', 0.297)
+        self.declare_parameter('field_height_meter', 0.210)
+
+        # Get params for field information
+        self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
+        self.field_max_x = self.get_parameter('field_max_x').get_parameter_value().double_value
+        self.field_min_y = self.get_parameter('field_min_y').get_parameter_value().double_value
+        self.field_max_y = self.get_parameter('field_max_y').get_parameter_value().double_value
+        self.field_width_meter = self.get_parameter('field_width_meter').get_parameter_value().double_value
+        self.field_height_meter = self.get_parameter('field_height_meter').get_parameter_value().double_value
+
+        # calculate scale
         self.scale_x = self.field_width_meter / (self.field_max_x - self.field_min_x)
         self.scale_y = self.field_height_meter / (self.field_max_y - self.field_min_y)
         self.get_logger().debug(f"scale_x = {self.scale_x}, scale_y = {self.scale_y}")

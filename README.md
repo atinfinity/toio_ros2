@@ -27,17 +27,42 @@ I checked this package on the following environment.
 ### Subscribed topics
 
 |topic name|Type|Description|
-|---|---|---|
+|:---|:---|:---|
 |/cmd_vel|`geometry_msgs/msg/Twist`|desired robot velocity|
 |/goal_pose|`geometry_msgs/msg/PoseStamped`|desired robot pose|
 
 ### Published topics
 
 |topic name|Type|Description|
-|---|---|---|
+|:---|:---|:---|
 |/toio/pose|`geometry_msgs/msg/PoseStamped`|toio pose in map frame|
 |/toio/battery_level|`std_msgs/msg/Float32`|battery level of toio|
 |/tf|-|a valid transform from `map` to `center`|
+
+### Parameters
+
+Default is a param for A4 mat. 
+Please see <https://toio.github.io/toio-spec/docs/hardware_position_id> in detail.
+
+|name|Type|Default|Description|
+|:---|:---|:---|:---|
+|field_min_x|double|98.0|minimum of `x` in field|
+|field_max_x|double|402.0|maximum of `x` in field|
+|field_min_y|double|142.0|minimum of `y` in field|
+|field_max_y|double|358.0|maximum of `y` in field|
+|field_width_meter|double|0.297|width of field(meter)|
+|field_height_meter|double|0.210|height of field(meter)|
+
+Parameter files is stored in [params](params).
+And, [launch/toio_ros2_bringup.launch.py](launch/toio_ros2_bringup.launch.py) load [params/toio_a4_play_mat_params.yaml](params/toio_a4_play_mat_params.yaml) as default.
+
+
+```python
+declare_params_file_cmd = DeclareLaunchArgument(
+    'params_file',
+    default_value=os.path.join(toio_ros2_dir, 'params', 'toio_a4_play_mat_params.yaml'),
+    description='Full path to the ROS2 parameters file to use toio_ros2 node')
+```
 
 ## Build
 

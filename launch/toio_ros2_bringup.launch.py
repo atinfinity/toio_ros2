@@ -16,6 +16,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.substitutions import LaunchConfiguration
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
@@ -24,17 +25,19 @@ def generate_launch_description():
     toio_ros2_dir = get_package_share_directory('toio_ros2')
     rviz_config_dir = os.path.join(toio_ros2_dir, 'rviz')
     rviz_config_file = os.path.join(rviz_config_dir, 'toio.rviz')
-
     toio_description_dir = get_package_share_directory('toio_description')
+
+    params_file = LaunchConfiguration('params_file')
+    declare_params_file_cmd = DeclareLaunchArgument(
+        'params_file',
+        default_value=os.path.join(toio_ros2_dir, 'params', 'toio_a4_play_mat_params.yaml'),
+        description='Full path to the ROS2 parameters file to use toio_ros2 node')
 
     toio_ros2_node = Node(
         package='toio_ros2',
         executable='toio_ros2_node',
         name='toio_ros2_node',
-        parameters=[
-            {
-            }
-        ],
+        parameters=[params_file],
         output='screen')
     
     toio_description_node = IncludeLaunchDescription(
@@ -57,6 +60,8 @@ def generate_launch_description():
         output='screen')
 
     ld = LaunchDescription()
+    ld.add_action(declare_params_file_cmd)
+
     ld.add_action(toio_ros2_node)
     ld.add_action(toio_description_node)
     ld.add_action(rviz2_node)
