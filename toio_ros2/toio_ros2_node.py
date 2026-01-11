@@ -39,8 +39,7 @@ class ToioNode(Node):
         self.max_input_speed = 115.0
         self.is_connected = False
 
-        # Get params for field information
-        # default is A4 params https://toio.github.io/toio-spec/docs/hardware_position_id
+        # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
         self.declare_parameter('field_min_x', 98.0)
         self.declare_parameter('field_max_x', 402.0)
         self.declare_parameter('field_min_y', 142.0)
@@ -48,6 +47,7 @@ class ToioNode(Node):
         self.declare_parameter('field_width_meter', 0.297)
         self.declare_parameter('field_height_meter', 0.210)
 
+        # Get params for field information
         self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
         self.field_max_x = self.get_parameter('field_max_x').get_parameter_value().double_value
         self.field_min_y = self.get_parameter('field_min_y').get_parameter_value().double_value
