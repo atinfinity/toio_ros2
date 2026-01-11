@@ -1,0 +1,8 @@
+toio_ros2_node:
+  ros__parameters:
+    field_min_x: 98.0
+    field_max_x: 402.0
+    field_min_y: 142.0
+    field_max_y: 358.0
+    field_width_meter: 0.420
+    field_height_meter: 0.297
