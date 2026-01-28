@@ -39,6 +39,9 @@ class ToioNode(Node):
         self.max_input_speed = 115.0
         self.is_connected = False
 
+        # Command deduplication (lerobot-style optimization)
+        self._last_motor_cmd: tuple = (0, 0)
+
         # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
         self.declare_parameter('field_min_x', 98.0)
         self.declare_parameter('field_max_x', 402.0)
@@ -81,9 +84,13 @@ class ToioNode(Node):
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
 
-        # timer
-        self.monitor_id_information_timer = self.create_timer(0.1, self.monitor_id_information_callback)
-        self.monitor_battery_information_timer = self.create_timer(0.1, self.monitor_battery_information_callback)
+        # timer (50Hz for position to match control rate, 1Hz for battery)
+        self.monitor_id_information_timer = self.create_timer(0.02, self.monitor_id_information_callback)
+        self.monitor_battery_information_timer = self.create_timer(1.0, self.monitor_battery_information_callback)
+
+        # Track pending async operations to avoid blocking
+        self._position_read_pending = False
+        self._battery_read_pending = False
 
         # create thread to call toio API
         self.loop = asyncio.new_event_loop()
@@ -149,23 +156,36 @@ class ToioNode(Node):
         if not self.is_connected:
             return
 
+        # Skip if a read is already pending (non-blocking pattern)
+        if self._position_read_pending:
+            return
+
+        self._position_read_pending = True
         future = asyncio.run_coroutine_threadsafe(
             self.get_cube_location(),
             self.loop)
-        result = future.result()
-        self.get_logger().debug(f'get_cube_location(), result = {result}')
+        future.add_done_callback(self._handle_position_result)
 
-        if result[0] and result[1]:
-            # convert ROS 2 coordinate
-            pos_x, pos_y, q_x, q_y, q_z, q_w = self.convert_toio_to_ros_coord(result[0][0], result[0][1], result[1])
+    def _handle_position_result(self, future) -> None:
+        """Handle position read result (non-blocking callback)."""
+        self._position_read_pending = False
+        try:
+            result = future.result(timeout=0)
+            self.get_logger().debug(f'get_cube_location(), result = {result}')
 
-            # publish PoseStamped
-            toio_pose_stamped_msg = self.make_pose_stamped_msg(pos_x, pos_y, q_x, q_y, q_z, q_w)
-            self.toio_pose_pub.publish(toio_pose_stamped_msg)
+            if result[0] and result[1]:
+                # convert ROS 2 coordinate
+                pos_x, pos_y, q_x, q_y, q_z, q_w = self.convert_toio_to_ros_coord(result[0][0], result[0][1], result[1])
 
-            # send the transformation
-            toio_transform = self.make_toio_transform(pos_x, pos_y, q_x, q_y, q_z, q_w)
-            self.tf_broadcaster.sendTransform(toio_transform)
+                # publish PoseStamped
+                toio_pose_stamped_msg = self.make_pose_stamped_msg(pos_x, pos_y, q_x, q_y, q_z, q_w)
+                self.toio_pose_pub.publish(toio_pose_stamped_msg)
+
+                # send the transformation
+                toio_transform = self.make_toio_transform(pos_x, pos_y, q_x, q_y, q_z, q_w)
+                self.tf_broadcaster.sendTransform(toio_transform)
+        except Exception as e:
+            self.get_logger().warn(f'Position read failed: {e}')
 
     def convert_toio_to_ros_coord(self, x, y, angle):
         pos_x = float(x - self.field_min_x) * self.scale_x
@@ -216,15 +236,28 @@ class ToioNode(Node):
         if not self.is_connected:
             return
 
+        # Skip if a read is already pending (non-blocking pattern)
+        if self._battery_read_pending:
+            return
+
+        self._battery_read_pending = True
         future = asyncio.run_coroutine_threadsafe(
             self.get_battery_information(),
             self.loop)
-        result = future.result()
-        if result:
-            battery_level_msg = Float32()
-            battery_level_msg.data = float(result)
-            self.toio_battery_level_pub.publish(battery_level_msg)
-            self.get_logger().debug(f'get_battery_information(), result = {result}')
+        future.add_done_callback(self._handle_battery_result)
+
+    def _handle_battery_result(self, future) -> None:
+        """Handle battery read result (non-blocking callback)."""
+        self._battery_read_pending = False
+        try:
+            result = future.result(timeout=0)
+            if result:
+                battery_level_msg = Float32()
+                battery_level_msg.data = float(result)
+                self.toio_battery_level_pub.publish(battery_level_msg)
+                self.get_logger().debug(f'get_battery_information(), result = {result}')
+        except Exception as e:
+            self.get_logger().warn(f'Battery read failed: {e}')
 
     # async function
     async def connect_toio(self) -> None:
@@ -235,7 +268,11 @@ class ToioNode(Node):
         self.get_logger().info('toio is connected.')
 
     async def motor_control(self, left_motor_speed, right_motor_speed) -> None:
-        await self.cube.api.motor.motor_control(left_motor_speed, right_motor_speed, duration_ms=500)
+        # Command deduplication: only send if different from last command
+        cmd = (left_motor_speed, right_motor_speed)
+        if cmd != self._last_motor_cmd:
+            await self.cube.api.motor.motor_control(left_motor_speed, right_motor_speed, duration_ms=500)
+            self._last_motor_cmd = cmd
 
     async def motor_control_target(self, x, y, angle) -> None:
         self.get_logger().debug(f'motor_control_target(): x = {x}, y={y}, angle = {angle}')
@@ -249,8 +286,8 @@ class ToioNode(Node):
                 rotation_option=RotationOption.AbsoluteOptimal,
             ),
         )
-
-        await asyncio.sleep(4)
+        # Removed blocking 4-second sleep - motor_control_target is async and
+        # completion should be handled by the caller or notification callbacks
 
     async def get_cube_location(self):
         data = await self.cube.api.id_information.read()
