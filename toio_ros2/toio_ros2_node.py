@@ -15,6 +15,7 @@
 import asyncio
 import threading
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -39,8 +40,10 @@ class ToioNode(Node):
         self.max_input_speed = 115.0
         self.is_connected = False
 
-        # Command deduplication (lerobot-style optimization)
+        # Command deduplication with time-based resend
         self._last_motor_cmd: tuple = (0, 0)
+        self._last_motor_cmd_time: float = 0.0
+        self.motor_dedup_interval = 0.3  # seconds
 
         # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
         self.declare_parameter('field_min_x', 98.0)
@@ -268,11 +271,14 @@ class ToioNode(Node):
         self.get_logger().info('toio is connected.')
 
     async def motor_control(self, left_motor_speed, right_motor_speed) -> None:
-        # Command deduplication: only send if different from last command
+        # Command deduplication with time-based resend:
+        # Skip only if same command AND sent less than dedup interval ago
         cmd = (left_motor_speed, right_motor_speed)
-        if cmd != self._last_motor_cmd:
+        now = time.monotonic()
+        if cmd != self._last_motor_cmd or (now - self._last_motor_cmd_time) >= self.motor_dedup_interval:
             await self.cube.api.motor.motor_control(left_motor_speed, right_motor_speed, duration_ms=500)
             self._last_motor_cmd = cmd
+            self._last_motor_cmd_time = now
 
     async def motor_control_target(self, x, y, angle) -> None:
         self.get_logger().debug(f'motor_control_target(): x = {x}, y={y}, angle = {angle}')
@@ -286,8 +292,7 @@ class ToioNode(Node):
                 rotation_option=RotationOption.AbsoluteOptimal,
             ),
         )
-        # Removed blocking 4-second sleep - motor_control_target is async and
-        # completion should be handled by the caller or notification callbacks
+
 
     async def get_cube_location(self):
         data = await self.cube.api.id_information.read()
