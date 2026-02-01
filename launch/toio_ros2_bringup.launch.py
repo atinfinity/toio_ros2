@@ -16,6 +16,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
@@ -28,10 +29,22 @@ def generate_launch_description():
     toio_description_dir = get_package_share_directory('toio_description')
 
     params_file = LaunchConfiguration('params_file')
+    use_rviz = LaunchConfiguration('use_rviz')
+
     declare_params_file_cmd = DeclareLaunchArgument(
         'params_file',
         default_value=os.path.join(toio_ros2_dir, 'params', 'toio_a4_play_mat_params.yaml'),
         description='Full path to the ROS2 parameters file to use toio_ros2 node')
+    """
+    declare_use_rviz_cmd = DeclareLaunchArgument(
+        'use_rviz',
+        default_value='true',
+        description='Use RViz2 if true'),
+    """
+    declare_use_rviz_cmd = DeclareLaunchArgument(
+        name='use_rviz',
+        default_value='true',
+        description='Use RViz2 if true')
 
     toio_ros2_node = Node(
         package='toio_ros2',
@@ -39,7 +52,7 @@ def generate_launch_description():
         name='toio_ros2_node',
         parameters=[params_file],
         output='screen')
-    
+
     toio_description_node = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(toio_description_dir, 'launch', 'robot_description.launch.py')
@@ -49,18 +62,16 @@ def generate_launch_description():
     )
 
     rviz2_node = Node(
+        condition=IfCondition(use_rviz),
         package='rviz2',
         executable='rviz2',
         name='rviz2',
         arguments=['-d', rviz_config_file],
-        parameters=[
-                {
-                }
-        ],
         output='screen')
 
     ld = LaunchDescription()
     ld.add_action(declare_params_file_cmd)
+    ld.add_action(declare_use_rviz_cmd)
 
     ld.add_action(toio_ros2_node)
     ld.add_action(toio_description_node)
