@@ -22,24 +22,22 @@ I checked this package on the following environment.
 - ROS 2 Jazzy
 - toio.py 1.10.0
 
-## Specification of toio_ros2
-
-### Subscribed topics
+## Subscribed topics
 
 |topic name|Type|Description|
 |:---|:---|:---|
-|/cmd_vel|`geometry_msgs/msg/Twist`|desired robot velocity|
-|/goal_pose|`geometry_msgs/msg/PoseStamped`|desired robot pose|
+|/cmd_vel|[geometry_msgs/msg/Twist](https://docs.ros2.org/foxy/api/geometry_msgs/msg/Twist.html)|desired robot velocity|
+|/goal_pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|desired robot pose|
 
-### Published topics
+## Published topics
 
 |topic name|Type|Description|
 |:---|:---|:---|
-|/toio/pose|`geometry_msgs/msg/PoseStamped`|toio pose in map frame|
-|/toio/battery_level|`std_msgs/msg/Float32`|battery level of toio|
+|/toio/pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|toio pose in map frame|
+|/toio/battery_level|[std_msgs/msg/Float32](https://docs.ros2.org/foxy/api/std_msgs/msg/Float32.html)|battery level of toio|
 |/tf|-|a valid transform from `map` to `center`|
 
-### Parameters
+## Parameters
 
 Default is a param for A4 mat. 
 Please see <https://toio.github.io/toio-spec/docs/hardware_position_id> in detail.
