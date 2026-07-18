@@ -1,6 +1,7 @@
-from setuptools import find_packages, setup
-import os
 from glob import glob
+import os
+
+from setuptools import find_packages, setup
 
 
 package_name = 'toio_ros2'
@@ -23,10 +24,9 @@ setup(
     maintainer_email='dandelion1124@gmail.com',
     description='toio_ros2',
     license='Apache-2.0',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            "toio_ros2_node = toio_ros2.toio_ros2_node:main",
+            'toio_ros2_node = toio_ros2.toio_ros2_node:main',
         ],
     },
 )

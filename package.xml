@@ -14,6 +14,14 @@
   <depend>tf_transformations</depend>
   <depend>toio_description</depend>
 
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <!-- Not resolvable via rosdep: the toio-py pip package (which uses bleak)
+       is also required at runtime. Install it with: pip install toio-py -->
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
