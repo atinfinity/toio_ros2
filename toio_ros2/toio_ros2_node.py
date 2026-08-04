@@ -39,6 +39,8 @@ class ToioNode(Node):
         self.max_rpm = 494.0
         self.max_input_speed = 115.0
         self.is_connected = False
+        self.connect_timeout = 10.0  # seconds
+        self.reconnect_interval = 3.0  # seconds
 
         # Command deduplication with time-based resend
         self._last_motor_cmd: tuple = (0, 0)
@@ -90,6 +92,7 @@ class ToioNode(Node):
         # timer (50Hz for position to match control rate, 1Hz for battery)
         self.monitor_id_information_timer = self.create_timer(0.02, self.monitor_id_information_callback)
         self.monitor_battery_information_timer = self.create_timer(1.0, self.monitor_battery_information_callback)
+        self.monitor_connection_timer = self.create_timer(1.0, self.monitor_connection_callback)
 
         # Track pending async operations to avoid blocking
         self._position_read_pending = False
@@ -176,7 +179,7 @@ class ToioNode(Node):
             result = future.result(timeout=0)
             self.get_logger().debug(f'get_cube_location(), result = {result}')
 
-            if result[0] and result[1]:
+            if result[0] is not None and result[1] is not None:
                 # convert ROS 2 coordinate
                 pos_x, pos_y, q_x, q_y, q_z, q_w = self.convert_toio_to_ros_coord(result[0][0], result[0][1], result[1])
 
@@ -201,12 +204,17 @@ class ToioNode(Node):
     def convert_ros_to_toio_coord(self, pos_x, pos_y, q_x, q_y, q_z, q_w):
         x = int((float(pos_x) / self.scale_x) + self.field_min_x)
         y = int(-(pos_y / self.scale_y) + self.field_min_y)
+        # clamp to the Position ID range of the mat
+        # (out-of-range values are not validated by toio.py and break BLE packing)
+        clamped_x = max(min(x, int(self.field_max_x)), int(self.field_min_x))
+        clamped_y = max(min(y, int(self.field_max_y)), int(self.field_min_y))
+        if (clamped_x, clamped_y) != (x, y):
+            self.get_logger().warn(
+                f'goal position ({x}, {y}) is outside the mat, clamped to ({clamped_x}, {clamped_y})')
         _, _, yaw_rad = euler_from_quaternion([q_x, q_y, q_z, q_w])
         yaw_deg = math.degrees(yaw_rad)
-        angle = int(360.0 - yaw_deg)
-        if angle > 360:
-            angle = angle - 360
-        return x, y, angle
+        angle = int(360.0 - yaw_deg) % 360
+        return clamped_x, clamped_y, angle
 
     def make_pose_stamped_msg(self, x, y, q_x, q_y, q_z, q_w):
         pose_stamped_msg = PoseStamped()
@@ -254,7 +262,7 @@ class ToioNode(Node):
         self._battery_read_pending = False
         try:
             result = future.result(timeout=0)
-            if result:
+            if result is not None:
                 battery_level_msg = Float32()
                 battery_level_msg.data = float(result)
                 self.toio_battery_level_pub.publish(battery_level_msg)
@@ -262,13 +270,36 @@ class ToioNode(Node):
         except Exception as e:
             self.get_logger().warn(f'Battery read failed: {e}')
 
+    def monitor_connection_callback(self) -> None:
+        if not self.is_connected:
+            return
+
+        if not self.cube.is_connect():
+            self.get_logger().error('toio is disconnected. reconnecting...')
+            self.is_connected = False
+            self._position_read_pending = False
+            self._battery_read_pending = False
+            asyncio.run_coroutine_threadsafe(
+                self.connect_toio(),
+                self.loop)
+
     # async function
     async def connect_toio(self) -> None:
-        self.cube = ToioCoreCube()
-        await self.cube.scan()
-        await self.cube.connect()
-        self.is_connected = True
-        self.get_logger().info('toio is connected.')
+        while rclpy.ok():
+            try:
+                self.cube = ToioCoreCube()
+                await self.cube.scan()
+                if self.cube.interface is None:
+                    raise RuntimeError('no toio cube found by BLE scan')
+                # connect() may wait forever on a silent BLE failure
+                await asyncio.wait_for(self.cube.connect(), timeout=self.connect_timeout)
+                self.is_connected = True
+                self.get_logger().info('toio is connected.')
+                return
+            except Exception as e:
+                self.get_logger().error(
+                    f'toio connection failed: {e}. retrying in {self.reconnect_interval}s...')
+                await asyncio.sleep(self.reconnect_interval)
 
     async def motor_control(self, left_motor_speed, right_motor_speed) -> None:
         # Command deduplication with time-based resend:
