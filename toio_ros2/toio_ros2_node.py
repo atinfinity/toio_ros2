@@ -18,6 +18,7 @@ import math
 import time
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from tf_transformations import quaternion_from_euler, euler_from_quaternion
 from tf2_ros import TransformBroadcaster
@@ -351,11 +352,13 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # SIGINT from `ros2 launch` shuts down the context before this
+        # `finally` runs; `try_shutdown()` is a no-op in that case.
+        rclpy.try_shutdown()
 
 if __name__ == '__main__':
     main()
