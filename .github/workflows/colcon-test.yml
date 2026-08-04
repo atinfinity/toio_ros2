@@ -1,0 +1,42 @@
+name: colcon-test
+
+on: push
+
+jobs:
+  colcon-test:
+    runs-on: ubuntu-latest
+    container: ros:jazzy-ros-base
+    steps:
+      - name: Checkout toio_ros2
+        uses: actions/checkout@v4
+        with:
+          path: src/toio_ros2
+
+      - name: Checkout toio_description
+        uses: actions/checkout@v4
+        with:
+          repository: atinfinity/toio_description
+          path: src/toio_description
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y python3-pip
+          rosdep update
+          rosdep install --from-paths src --ignore-src -y
+          pip3 install --break-system-packages toio-py
+
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --packages-up-to toio_ros2
+
+      - name: Test
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          colcon test --packages-select toio_ros2 --event-handlers console_cohesion+
+          colcon test-result --verbose
