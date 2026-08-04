@@ -43,6 +43,10 @@ class ToioNode(Node):
         self.is_connected = False
         self.connect_timeout = 10.0  # seconds
         self.reconnect_interval = 3.0  # seconds
+        # Serializes the connected -> disconnected transition between the
+        # rclpy executor thread (1Hz monitor) and the asyncio loop thread
+        # (motor send failure), so only one reconnection is ever scheduled
+        self._reconnect_lock = threading.Lock()
 
         # Command deduplication with time-based resend
         self._last_motor_cmd: tuple = (0, 0)
@@ -264,11 +268,18 @@ class ToioNode(Node):
             return
 
         if not self.cube.is_connect():
-            self.get_logger().error('toio is disconnected. reconnecting...')
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Flip to disconnected and start reconnection exactly once."""
+        with self._reconnect_lock:
+            if not self.is_connected:
+                return
             self.is_connected = False
-            asyncio.run_coroutine_threadsafe(
-                self.connect_toio(),
-                self.loop)
+        self.get_logger().error('toio is disconnected. reconnecting...')
+        asyncio.run_coroutine_threadsafe(
+            self.connect_toio(),
+            self.loop)
 
     # async function
     async def connect_toio(self) -> None:
@@ -310,6 +321,10 @@ class ToioNode(Node):
                 await self.motor_control(*cmd)
             except Exception as e:
                 self.get_logger().debug(f'motor command failed: {e}')
+                # React to disconnection as soon as a send fails instead of
+                # waiting up to 1s for the monitor timer (see issue #10)
+                if not self.cube.is_connect():
+                    self._schedule_reconnect()
 
     async def motor_control(self, left_motor_speed, right_motor_speed) -> None:
         # Command deduplication with time-based resend:
