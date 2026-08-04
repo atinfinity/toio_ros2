@@ -18,6 +18,7 @@ import math
 import time
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from tf_transformations import quaternion_from_euler, euler_from_quaternion
 from tf2_ros import TransformBroadcaster
@@ -46,6 +47,13 @@ class ToioNode(Node):
         self._last_motor_cmd: tuple = (0, 0)
         self._last_motor_cmd_time: float = 0.0
         self.motor_dedup_interval = 0.3  # seconds
+
+        # Latest-command-only pattern for cmd_vel: the subscriber only stores
+        # the newest command and motor_command_loop() sends it, so BLE writes
+        # never queue up behind a fast publisher
+        self._latest_cmd_vel: tuple = None
+        self._latest_cmd_vel_stamp: float = 0.0
+        self.cmd_vel_timeout = 0.5  # seconds, matches motor duration_ms=500
 
         # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
         self.declare_parameter('field_min_x', 98.0)
@@ -89,14 +97,8 @@ class ToioNode(Node):
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
 
-        # timer (50Hz for position to match control rate, 1Hz for battery)
-        self.monitor_id_information_timer = self.create_timer(0.02, self.monitor_id_information_callback)
-        self.monitor_battery_information_timer = self.create_timer(1.0, self.monitor_battery_information_callback)
+        # timer
         self.monitor_connection_timer = self.create_timer(1.0, self.monitor_connection_callback)
-
-        # Track pending async operations to avoid blocking
-        self._position_read_pending = False
-        self._battery_read_pending = False
 
         # create thread to call toio API
         self.loop = asyncio.new_event_loop()
@@ -105,6 +107,9 @@ class ToioNode(Node):
         self.thread.start()
         asyncio.run_coroutine_threadsafe(
             self.connect_toio(),
+            self.loop)
+        asyncio.run_coroutine_threadsafe(
+            self.motor_command_loop(),
             self.loop)
 
     def start_loop(self) -> None:
@@ -135,9 +140,9 @@ class ToioNode(Node):
         left_motor_speed = int((rpm_l / self.max_rpm) * self.max_input_speed)
         right_motor_speed = int((rpm_r / self.max_rpm) * self.max_input_speed)
 
-        asyncio.run_coroutine_threadsafe(
-            self.motor_control(left_motor_speed, right_motor_speed),
-            self.loop)
+        # tuple assignment is atomic, read by motor_command_loop()
+        self._latest_cmd_vel = (left_motor_speed, right_motor_speed)
+        self._latest_cmd_vel_stamp = time.monotonic()
 
     def goal_pose_callback(self, msg: PoseStamped) -> None:
         if not self.is_connected:
@@ -158,40 +163,24 @@ class ToioNode(Node):
     def linear_speed_to_rpm(self, v_lin: float) -> float:
         return (v_lin / (2.0 * math.pi * self.wheel_radius)) * 60.0
 
-    def monitor_id_information_callback(self) -> None:
-        if not self.is_connected:
+    def _on_id_notification(self, payload: bytearray) -> None:
+        """Handle Position ID notification (called on the asyncio loop thread)."""
+        info = IdInformation.is_my_data(payload)
+        # PositionIdMissed (cube left the mat) and StandardId are not published
+        if not isinstance(info, PositionId):
             return
 
-        # Skip if a read is already pending (non-blocking pattern)
-        if self._position_read_pending:
-            return
+        # convert ROS 2 coordinate
+        pos_x, pos_y, q_x, q_y, q_z, q_w = self.convert_toio_to_ros_coord(
+            info.center.point.x, info.center.point.y, info.center.angle)
 
-        self._position_read_pending = True
-        future = asyncio.run_coroutine_threadsafe(
-            self.get_cube_location(),
-            self.loop)
-        future.add_done_callback(self._handle_position_result)
+        # publish PoseStamped
+        toio_pose_stamped_msg = self.make_pose_stamped_msg(pos_x, pos_y, q_x, q_y, q_z, q_w)
+        self.toio_pose_pub.publish(toio_pose_stamped_msg)
 
-    def _handle_position_result(self, future) -> None:
-        """Handle position read result (non-blocking callback)."""
-        self._position_read_pending = False
-        try:
-            result = future.result(timeout=0)
-            self.get_logger().debug(f'get_cube_location(), result = {result}')
-
-            if result[0] is not None and result[1] is not None:
-                # convert ROS 2 coordinate
-                pos_x, pos_y, q_x, q_y, q_z, q_w = self.convert_toio_to_ros_coord(result[0][0], result[0][1], result[1])
-
-                # publish PoseStamped
-                toio_pose_stamped_msg = self.make_pose_stamped_msg(pos_x, pos_y, q_x, q_y, q_z, q_w)
-                self.toio_pose_pub.publish(toio_pose_stamped_msg)
-
-                # send the transformation
-                toio_transform = self.make_toio_transform(pos_x, pos_y, q_x, q_y, q_z, q_w)
-                self.tf_broadcaster.sendTransform(toio_transform)
-        except Exception as e:
-            self.get_logger().warn(f'Position read failed: {e}')
+        # send the transformation
+        toio_transform = self.make_toio_transform(pos_x, pos_y, q_x, q_y, q_z, q_w)
+        self.tf_broadcaster.sendTransform(toio_transform)
 
     def convert_toio_to_ros_coord(self, x, y, angle):
         pos_x = float(x - self.field_min_x) * self.scale_x
@@ -222,6 +211,9 @@ class ToioNode(Node):
         pose_stamped_msg.header.frame_id = 'map'
         pose_stamped_msg.pose.position.x = x
         pose_stamped_msg.pose.position.y = y
+        # z is the geometric center of the cube body so the RViz Pose arrow
+        # does not sink into the ground grid; the map->center TF stays at z=0
+        # because the URDF 'center' frame is at the ground-contact plane
         pose_stamped_msg.pose.position.z = self.cube_height / 2.0
         pose_stamped_msg.pose.orientation.x = q_x
         pose_stamped_msg.pose.orientation.y = q_y
@@ -243,32 +235,16 @@ class ToioNode(Node):
         transform.transform.rotation.w = q_w
         return transform
 
-    def monitor_battery_information_callback(self) -> None:
-        if not self.is_connected:
+    def _on_battery_notification(self, payload: bytearray) -> None:
+        """Handle battery notification (called on the asyncio loop thread)."""
+        info = Battery.is_my_data(payload)
+        if info is None:
             return
 
-        # Skip if a read is already pending (non-blocking pattern)
-        if self._battery_read_pending:
-            return
-
-        self._battery_read_pending = True
-        future = asyncio.run_coroutine_threadsafe(
-            self.get_battery_information(),
-            self.loop)
-        future.add_done_callback(self._handle_battery_result)
-
-    def _handle_battery_result(self, future) -> None:
-        """Handle battery read result (non-blocking callback)."""
-        self._battery_read_pending = False
-        try:
-            result = future.result(timeout=0)
-            if result is not None:
-                battery_level_msg = Float32()
-                battery_level_msg.data = float(result)
-                self.toio_battery_level_pub.publish(battery_level_msg)
-                self.get_logger().debug(f'get_battery_information(), result = {result}')
-        except Exception as e:
-            self.get_logger().warn(f'Battery read failed: {e}')
+        battery_level_msg = Float32()
+        battery_level_msg.data = float(info.battery_level)
+        self.toio_battery_level_pub.publish(battery_level_msg)
+        self.get_logger().debug(f'battery_level = {info.battery_level}')
 
     def monitor_connection_callback(self) -> None:
         if not self.is_connected:
@@ -277,8 +253,6 @@ class ToioNode(Node):
         if not self.cube.is_connect():
             self.get_logger().error('toio is disconnected. reconnecting...')
             self.is_connected = False
-            self._position_read_pending = False
-            self._battery_read_pending = False
             asyncio.run_coroutine_threadsafe(
                 self.connect_toio(),
                 self.loop)
@@ -293,6 +267,12 @@ class ToioNode(Node):
                     raise RuntimeError('no toio cube found by BLE scan')
                 # connect() may wait forever on a silent BLE failure
                 await asyncio.wait_for(self.cube.connect(), timeout=self.connect_timeout)
+                # cube.api is created inside connect(), so register handlers here;
+                # reconnection is covered because a fresh cube is built each attempt
+                await self.cube.api.id_information.register_notification_handler(
+                    self._on_id_notification)
+                await self.cube.api.battery.register_notification_handler(
+                    self._on_battery_notification)
                 self.is_connected = True
                 self.get_logger().info('toio is connected.')
                 return
@@ -301,12 +281,32 @@ class ToioNode(Node):
                     f'toio connection failed: {e}. retrying in {self.reconnect_interval}s...')
                 await asyncio.sleep(self.reconnect_interval)
 
+    async def motor_command_loop(self) -> None:
+        # Resident sender: reads the latest cmd_vel at a fixed rate so BLE
+        # writes are bounded to 20Hz no matter how fast cmd_vel is published
+        while rclpy.ok():
+            await asyncio.sleep(0.05)  # 20Hz
+            if not self.is_connected or self._latest_cmd_vel is None:
+                continue
+            cmd = self._latest_cmd_vel
+            # Send stop when cmd_vel goes silent, keeping the auto-stop
+            # semantics of duration_ms=500
+            if time.monotonic() - self._latest_cmd_vel_stamp > self.cmd_vel_timeout:
+                cmd = (0, 0)
+            try:
+                await self.motor_control(*cmd)
+            except Exception as e:
+                self.get_logger().debug(f'motor command failed: {e}')
+
     async def motor_control(self, left_motor_speed, right_motor_speed) -> None:
         # Command deduplication with time-based resend:
-        # Skip only if same command AND sent less than dedup interval ago
+        # Skip if same command AND sent less than dedup interval ago.
+        # A stop command is never resent (the motor is already stopped and
+        # duration_ms guarantees auto-stop), avoiding idle BLE writes.
         cmd = (left_motor_speed, right_motor_speed)
         now = time.monotonic()
-        if cmd != self._last_motor_cmd or (now - self._last_motor_cmd_time) >= self.motor_dedup_interval:
+        if cmd != self._last_motor_cmd or \
+                (cmd != (0, 0) and (now - self._last_motor_cmd_time) >= self.motor_dedup_interval):
             await self.cube.api.motor.motor_control(left_motor_speed, right_motor_speed, duration_ms=500)
             self._last_motor_cmd = cmd
             self._last_motor_cmd_time = now
@@ -325,22 +325,26 @@ class ToioNode(Node):
         )
 
 
-    async def get_cube_location(self):
-        data = await self.cube.api.id_information.read()
-        if hasattr(data, 'center') and hasattr(data.center, 'point') and hasattr(data.center, 'angle'):
-            pos = (data.center.point.x, data.center.point.y)
-            angle = data.center.angle
-            self.get_logger().debug(f'pos = {pos}, angle = {angle}')
-            return pos, angle
-        return None, None
+    async def shutdown_toio(self) -> None:
+        if self.is_connected:
+            self.is_connected = False  # stop motor_command_loop / watchdog sends
+            await self.cube.api.motor.motor_control(0, 0)
+            # passing None unregisters all handlers
+            await self.cube.api.id_information.unregister_notification_handler(None)
+            await self.cube.api.battery.unregister_notification_handler(None)
+            await self.cube.disconnect()
 
-    async def get_battery_information(self):
-        data = await self.cube.api.battery.read()
-        if hasattr(data, 'battery_level'):
-            battery_level = data.battery_level
-            self.get_logger().debug(f'battery_level = {battery_level}')
-            return battery_level
-        return None
+    def destroy_node(self):
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.shutdown_toio(),
+                self.loop)
+            future.result(timeout=5.0)
+        except Exception as e:
+            self.get_logger().warn(f'toio shutdown failed: {e}')
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(timeout=2.0)
+        super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
@@ -348,11 +352,13 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # SIGINT from `ros2 launch` shuts down the context before this
+        # `finally` runs; `try_shutdown()` is a no-op in that case.
+        rclpy.try_shutdown()
 
 if __name__ == '__main__':
     main()
