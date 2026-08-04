@@ -24,7 +24,7 @@ from rclpy.node import Node
 from std_msgs.msg import Float32
 from tf2_ros import TransformBroadcaster
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
-from toio import (Battery, CubeLocation, IdInformation, Motor,
+from toio import (Battery, BLEScanner, CubeLocation, IdInformation, Motor,
                   MotorResponseCode, MovementType, Point, PositionId,
                   ResponseMotorControlTarget, RotationOption, Speed,
                   SpeedChangeType, TargetPosition, ToioCoreCube)
@@ -76,6 +76,14 @@ class ToioNode(Node):
         # mat boundary so the cube's ID sensor stays in the readable area
         self.declare_parameter('goal_boundary_margin', 10)
 
+        # Cube identification (issue #14). Both empty (default): connect to
+        # the nearest cube found by the scan. cube_id is the trailing part of
+        # the BLE local name 'toio Core Cube-XXX' and is platform independent;
+        # cube_address is a MAC address (Linux/Windows) or a CoreBluetooth
+        # UUID (macOS). cube_id takes precedence when both are set.
+        self.declare_parameter('cube_id', '')
+        self.declare_parameter('cube_address', '')
+
         # Get params for field information
         self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
         self.field_max_x = self.get_parameter('field_max_x').get_parameter_value().double_value
@@ -93,6 +101,9 @@ class ToioNode(Node):
             'goal_timeout').get_parameter_value().integer_value
         self.goal_boundary_margin = self.get_parameter(
             'goal_boundary_margin').get_parameter_value().integer_value
+        self.cube_id = self.get_parameter('cube_id').get_parameter_value().string_value
+        self.cube_address = self.get_parameter(
+            'cube_address').get_parameter_value().string_value
 
         # calculate scale
         self.scale_x = self.field_width_meter / (self.field_max_x - self.field_min_x)
@@ -305,14 +316,36 @@ class ToioNode(Node):
             self.connect_toio(),
             self.loop)
 
+    async def scan_toio(self):
+        """Scan and select the cube to connect to (returns a CubeInfo or None)."""
+        if self.cube_id:
+            found = await BLEScanner.scan_with_id(cube_id={self.cube_id})
+        elif self.cube_address:
+            found = await BLEScanner.scan_with_address(address={self.cube_address})
+        else:
+            # Auto-connect mode: scan for up to two cubes so that other
+            # cubes nearby can be reported. With a single powered cube this
+            # waits for the full scan timeout (5s) before connecting.
+            found = await BLEScanner.scan(2)
+            for cube_info in found:
+                self.get_logger().info(
+                    f'found cube: {cube_info.name} ({cube_info.device.address})')
+            if len(found) > 1:
+                self.get_logger().warn(
+                    f'{len(found)} cubes found; connecting to the nearest one. '
+                    'set the cube_id parameter to select a specific cube')
+        if not found:
+            return None
+        return found[0]
+
     # async function
     async def connect_toio(self) -> None:
         while rclpy.ok():
             try:
-                self.cube = ToioCoreCube()
-                await self.cube.scan()
-                if self.cube.interface is None:
+                cube_info = await self.scan_toio()
+                if cube_info is None:
                     raise RuntimeError('no toio cube found by BLE scan')
+                self.cube = ToioCoreCube(interface=cube_info.interface, name=cube_info.name)
                 # connect() may wait forever on a silent BLE failure
                 await asyncio.wait_for(self.cube.connect(), timeout=self.connect_timeout)
                 # cube.api is created inside connect(), so register handlers here;
@@ -324,7 +357,8 @@ class ToioNode(Node):
                 await self.cube.api.motor.register_notification_handler(
                     self._on_motor_notification)
                 self.is_connected = True
-                self.get_logger().info('toio is connected.')
+                self.get_logger().info(
+                    f'toio is connected: {cube_info.name} ({cube_info.device.address})')
                 return
             except Exception as e:
                 self.get_logger().error(

@@ -15,12 +15,14 @@
 import asyncio
 import math
 import struct
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from geometry_msgs.msg import PoseStamped, Twist
 import pytest
 import rclpy
 from tf_transformations import euler_from_quaternion
+from toio.device_interface import CubeInfo
 
 from toio_ros2.toio_ros2_node import ToioNode
 
@@ -202,6 +204,72 @@ def test_motor_notification_accepts_target_responses(node):
     node._on_motor_notification(success)
     node._on_motor_notification(id_missed)
     node._on_motor_notification(motor_speed)
+
+
+def make_cube_info(name, address):
+    return CubeInfo(
+        name=name,
+        device=SimpleNamespace(address=address),
+        interface=MagicMock(),
+        advertisement=None)
+
+
+def test_scan_toio_with_cube_id(node, monkeypatch):
+    info = make_cube_info('toio Core Cube-C7f', 'AA:BB')
+    scanner = MagicMock()
+    scanner.scan_with_id = AsyncMock(return_value=[info])
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.BLEScanner', scanner)
+
+    node.cube_id = 'C7f'
+    assert asyncio.run(node.scan_toio()) is info
+    scanner.scan_with_id.assert_awaited_once_with(cube_id={'C7f'})
+
+
+def test_scan_toio_with_cube_address(node, monkeypatch):
+    info = make_cube_info('toio Core Cube-C7f', 'AA:BB')
+    scanner = MagicMock()
+    scanner.scan_with_address = AsyncMock(return_value=[info])
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.BLEScanner', scanner)
+
+    node.cube_address = 'AA:BB'
+    assert asyncio.run(node.scan_toio()) is info
+    scanner.scan_with_address.assert_awaited_once_with(address={'AA:BB'})
+
+
+def test_scan_toio_cube_id_takes_precedence(node, monkeypatch):
+    info = make_cube_info('toio Core Cube-C7f', 'AA:BB')
+    scanner = MagicMock()
+    scanner.scan_with_id = AsyncMock(return_value=[info])
+    scanner.scan_with_address = AsyncMock(return_value=[])
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.BLEScanner', scanner)
+
+    node.cube_id = 'C7f'
+    node.cube_address = 'AA:BB'
+    assert asyncio.run(node.scan_toio()) is info
+    scanner.scan_with_address.assert_not_awaited()
+
+
+def test_scan_toio_auto_mode_picks_nearest(node, monkeypatch):
+    nearest = make_cube_info('toio Core Cube-C7f', 'AA:BB')
+    other = make_cube_info('toio Core Cube-p9G', 'CC:DD')
+    scanner = MagicMock()
+    scanner.scan = AsyncMock(return_value=[nearest, other])
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.BLEScanner', scanner)
+
+    # default: cube_id and cube_address are both empty
+    assert asyncio.run(node.scan_toio()) is nearest
+    scanner.scan.assert_awaited_once_with(2)
+
+
+def test_scan_toio_returns_none_when_not_found(node, monkeypatch):
+    scanner = MagicMock()
+    scanner.scan = AsyncMock(return_value=[])
+    scanner.scan_with_id = AsyncMock(return_value=[])
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.BLEScanner', scanner)
+
+    assert asyncio.run(node.scan_toio()) is None
+    node.cube_id = 'C7f'
+    assert asyncio.run(node.scan_toio()) is None
 
 
 def test_schedule_reconnect_runs_only_once(node, monkeypatch):
