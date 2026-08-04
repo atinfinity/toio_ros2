@@ -24,9 +24,10 @@ from rclpy.node import Node
 from std_msgs.msg import Float32
 from tf2_ros import TransformBroadcaster
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
-from toio import (Battery, CubeLocation, IdInformation, MovementType, Point,
-                  PositionId, RotationOption, Speed, SpeedChangeType,
-                  TargetPosition, ToioCoreCube)
+from toio import (Battery, CubeLocation, IdInformation, Motor,
+                  MotorResponseCode, MovementType, Point, PositionId,
+                  ResponseMotorControlTarget, RotationOption, Speed,
+                  SpeedChangeType, TargetPosition, ToioCoreCube)
 
 
 class ToioNode(Node):
@@ -71,6 +72,9 @@ class ToioNode(Node):
         # Params for goal_pose motion
         self.declare_parameter('goal_max_speed', 30)
         self.declare_parameter('goal_timeout', 60)
+        # Margin (in Position ID units) kept between a clamped goal and the
+        # mat boundary so the cube's ID sensor stays in the readable area
+        self.declare_parameter('goal_boundary_margin', 10)
 
         # Get params for field information
         self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
@@ -87,6 +91,8 @@ class ToioNode(Node):
             'goal_max_speed').get_parameter_value().integer_value
         self.goal_timeout = self.get_parameter(
             'goal_timeout').get_parameter_value().integer_value
+        self.goal_boundary_margin = self.get_parameter(
+            'goal_boundary_margin').get_parameter_value().integer_value
 
         # calculate scale
         self.scale_x = self.field_width_meter / (self.field_max_x - self.field_min_x)
@@ -209,13 +215,17 @@ class ToioNode(Node):
     def convert_ros_to_toio_coord(self, pos_x, pos_y, q_x, q_y, q_z, q_w):
         x = int((float(pos_x) / self.scale_x) + self.field_min_x)
         y = int(-(pos_y / self.scale_y) + self.field_min_y)
-        # clamp to the Position ID range of the mat
-        # (out-of-range values are not validated by toio.py and break BLE packing)
-        clamped_x = max(min(x, int(self.field_max_x)), int(self.field_min_x))
-        clamped_y = max(min(y, int(self.field_max_y)), int(self.field_min_y))
+        # clamp to the Position ID range of the mat with a margin
+        # (out-of-range values are not validated by toio.py and break BLE
+        # packing; a goal at the exact boundary makes the cube lose the
+        # Position ID at the edge and abort mid-drive, see issue #9)
+        clamped_x = max(min(x, int(self.field_max_x) - self.goal_boundary_margin),
+                        int(self.field_min_x) + self.goal_boundary_margin)
+        clamped_y = max(min(y, int(self.field_max_y) - self.goal_boundary_margin),
+                        int(self.field_min_y) + self.goal_boundary_margin)
         if (clamped_x, clamped_y) != (x, y):
             self.get_logger().warn(
-                f'goal position ({x}, {y}) is outside the mat, '
+                f'goal position ({x}, {y}) is outside the safe mat area, '
                 f'clamped to ({clamped_x}, {clamped_y})')
         _, _, yaw_rad = euler_from_quaternion([q_x, q_y, q_z, q_w])
         yaw_deg = math.degrees(yaw_rad)
@@ -263,6 +273,20 @@ class ToioNode(Node):
         self.toio_battery_level_pub.publish(battery_level_msg)
         self.get_logger().debug(f'battery_level = {info.battery_level}')
 
+    def _on_motor_notification(self, payload: bytearray) -> None:
+        """Handle motor response notification (called on the asyncio loop thread)."""
+        info = Motor.is_my_data(payload)
+        # only motor_control_target results are reported (issue #9);
+        # motor_control() used for cmd_vel does not send responses
+        if not isinstance(info, ResponseMotorControlTarget):
+            return
+
+        if info.response_code in (MotorResponseCode.SUCCESS,
+                                  MotorResponseCode.SUCCESS_WITH_OVERWRITE):
+            self.get_logger().info(f'goal result: {info.response_code.name}')
+        else:
+            self.get_logger().warn(f'goal aborted: {info.response_code.name}')
+
     def monitor_connection_callback(self) -> None:
         if not self.is_connected:
             return
@@ -297,6 +321,8 @@ class ToioNode(Node):
                     self._on_id_notification)
                 await self.cube.api.battery.register_notification_handler(
                     self._on_battery_notification)
+                await self.cube.api.motor.register_notification_handler(
+                    self._on_motor_notification)
                 self.is_connected = True
                 self.get_logger().info('toio is connected.')
                 return
@@ -361,6 +387,7 @@ class ToioNode(Node):
             # passing None unregisters all handlers
             await self.cube.api.id_information.unregister_notification_handler(None)
             await self.cube.api.battery.unregister_notification_handler(None)
+            await self.cube.api.motor.unregister_notification_handler(None)
             await self.cube.disconnect()
 
     def destroy_node(self):
