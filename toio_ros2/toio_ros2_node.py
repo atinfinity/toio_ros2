@@ -13,28 +13,29 @@
 # limitations under the License.
 
 import asyncio
-import threading
 import math
+import threading
 import time
 
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from tf_transformations import quaternion_from_euler, euler_from_quaternion
-from tf2_ros import TransformBroadcaster
 from std_msgs.msg import Float32
-from geometry_msgs.msg import Twist, PoseStamped, TransformStamped
-
-from toio import *
+from tf2_ros import TransformBroadcaster
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
+from toio import (Battery, CubeLocation, IdInformation, MovementType, Point,
+                  PositionId, RotationOption, Speed, SpeedChangeType,
+                  TargetPosition, ToioCoreCube)
 
 
 class ToioNode(Node):
     def __init__(self) -> None:
         super().__init__('toio_ros2_node')
         # https://toio.github.io/toio-spec/en/docs/hardware_shape
-        self.wheel_base = 0.0266 # meter
-        self.wheel_radius = 0.00625 # meter
-        self.cube_height = 0.0256 # meter
+        self.wheel_base = 0.0266  # meter
+        self.wheel_radius = 0.00625  # meter
+        self.cube_height = 0.0256  # meter
 
         # https://toio.github.io/toio-spec/en/docs/ble_motor
         self.max_rpm = 494.0
@@ -63,18 +64,30 @@ class ToioNode(Node):
         self.declare_parameter('field_width_meter', 0.297)
         self.declare_parameter('field_height_meter', 0.210)
 
+        # Params for goal_pose motion
+        self.declare_parameter('goal_max_speed', 30)
+        self.declare_parameter('goal_timeout', 60)
+
         # Get params for field information
         self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
         self.field_max_x = self.get_parameter('field_max_x').get_parameter_value().double_value
         self.field_min_y = self.get_parameter('field_min_y').get_parameter_value().double_value
         self.field_max_y = self.get_parameter('field_max_y').get_parameter_value().double_value
-        self.field_width_meter = self.get_parameter('field_width_meter').get_parameter_value().double_value
-        self.field_height_meter = self.get_parameter('field_height_meter').get_parameter_value().double_value
+        self.field_width_meter = self.get_parameter(
+            'field_width_meter').get_parameter_value().double_value
+        self.field_height_meter = self.get_parameter(
+            'field_height_meter').get_parameter_value().double_value
+
+        # Get params for goal_pose motion
+        self.goal_max_speed = self.get_parameter(
+            'goal_max_speed').get_parameter_value().integer_value
+        self.goal_timeout = self.get_parameter(
+            'goal_timeout').get_parameter_value().integer_value
 
         # calculate scale
         self.scale_x = self.field_width_meter / (self.field_max_x - self.field_min_x)
         self.scale_y = self.field_height_meter / (self.field_max_y - self.field_min_y)
-        self.get_logger().debug(f"scale_x = {self.scale_x}, scale_y = {self.scale_y}")
+        self.get_logger().debug(f'scale_x = {self.scale_x}, scale_y = {self.scale_y}')
 
         # subscriber
         self.cmd_vel_sub = self.create_subscription(
@@ -82,17 +95,16 @@ class ToioNode(Node):
             'cmd_vel',
             self.cmd_vel_callback,
             10)
-        self.cmd_vel_sub
         self.goal_pose_sub = self.create_subscription(
             PoseStamped,
             'goal_pose',
             self.goal_pose_callback,
             10)
-        self.goal_pose_sub
 
         # publisher
         self.toio_pose_pub = self.create_publisher(PoseStamped, 'toio/pose', qos_profile=10)
-        self.toio_battery_level_pub = self.create_publisher(Float32, 'toio/battery_level', qos_profile=10)
+        self.toio_battery_level_pub = self.create_publisher(
+            Float32, 'toio/battery_level', qos_profile=10)
 
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -134,7 +146,7 @@ class ToioNode(Node):
         # clip
         rpm_l = max(min(rpm_l,  self.max_rpm), -self.max_rpm)
         rpm_r = max(min(rpm_r,  self.max_rpm), -self.max_rpm)
-        self.get_logger().debug(f"rpm_l = {rpm_l}, rpm_r = {rpm_r}")
+        self.get_logger().debug(f'rpm_l = {rpm_l}, rpm_r = {rpm_r}')
 
         # RPM -> toio motor_speed
         left_motor_speed = int((rpm_l / self.max_rpm) * self.max_input_speed)
@@ -185,7 +197,7 @@ class ToioNode(Node):
     def convert_toio_to_ros_coord(self, x, y, angle):
         pos_x = float(x - self.field_min_x) * self.scale_x
         pos_y = -float(y - self.field_min_y) * self.scale_y
-        yaw_deg = 360.0 - float(angle) # deg
+        yaw_deg = 360.0 - float(angle)  # deg
         yaw_rad = math.radians(yaw_deg)
         q_x, q_y, q_z, q_w = quaternion_from_euler(0.0, 0.0, yaw_rad)
         return pos_x, pos_y, q_x, q_y, q_z, q_w
@@ -199,7 +211,8 @@ class ToioNode(Node):
         clamped_y = max(min(y, int(self.field_max_y)), int(self.field_min_y))
         if (clamped_x, clamped_y) != (x, y):
             self.get_logger().warn(
-                f'goal position ({x}, {y}) is outside the mat, clamped to ({clamped_x}, {clamped_y})')
+                f'goal position ({x}, {y}) is outside the mat, '
+                f'clamped to ({clamped_x}, {clamped_y})')
         _, _, yaw_rad = euler_from_quaternion([q_x, q_y, q_z, q_w])
         yaw_deg = math.degrees(yaw_rad)
         angle = int(360.0 - yaw_deg) % 360
@@ -307,23 +320,24 @@ class ToioNode(Node):
         now = time.monotonic()
         if cmd != self._last_motor_cmd or \
                 (cmd != (0, 0) and (now - self._last_motor_cmd_time) >= self.motor_dedup_interval):
-            await self.cube.api.motor.motor_control(left_motor_speed, right_motor_speed, duration_ms=500)
+            await self.cube.api.motor.motor_control(
+                left_motor_speed, right_motor_speed, duration_ms=500)
             self._last_motor_cmd = cmd
             self._last_motor_cmd_time = now
 
     async def motor_control_target(self, x, y, angle) -> None:
         self.get_logger().debug(f'motor_control_target(): x = {x}, y={y}, angle = {angle}')
         await self.cube.api.motor.motor_control_target(
-            timeout=60,
+            timeout=self.goal_timeout,
             movement_type=MovementType.Linear,
             speed=Speed(
-                max=30, speed_change_type=SpeedChangeType.AccelerationAndDeceleration),
+                max=self.goal_max_speed,
+                speed_change_type=SpeedChangeType.AccelerationAndDeceleration),
             target=TargetPosition(
                 cube_location=CubeLocation(point=Point(x=x, y=y), angle=angle),
                 rotation_option=RotationOption.AbsoluteOptimal,
             ),
         )
-
 
     async def shutdown_toio(self) -> None:
         if self.is_connected:
@@ -346,6 +360,7 @@ class ToioNode(Node):
         self.thread.join(timeout=2.0)
         super().destroy_node()
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = ToioNode()
@@ -359,6 +374,7 @@ def main(args=None):
         # SIGINT from `ros2 launch` shuts down the context before this
         # `finally` runs; `try_shutdown()` is a no-op in that case.
         rclpy.try_shutdown()
+
 
 if __name__ == '__main__':
     main()
