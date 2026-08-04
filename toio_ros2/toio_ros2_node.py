@@ -19,6 +19,7 @@ import time
 
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Float32
 from tf2_ros import TransformBroadcaster
@@ -366,11 +367,13 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        # SIGINT from `ros2 launch` shuts down the context before this
+        # `finally` runs; `try_shutdown()` is a no-op in that case.
+        rclpy.try_shutdown()
 
 
 if __name__ == '__main__':
