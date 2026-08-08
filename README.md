@@ -50,6 +50,11 @@ Please see <https://toio.github.io/toio-spec/docs/hardware_position_id> in detai
 |field_max_y|double|358.0|maximum of `y` in field|
 |field_width_meter|double|0.297|width of field(meter)|
 |field_height_meter|double|0.210|height of field(meter)|
+|goal_max_speed|int|30|maximum motor speed for `goal_pose` motion|
+|goal_timeout|int|60|timeout(second) for `goal_pose` motion|
+|goal_boundary_margin|int|10|margin(Position ID units) kept between a clamped goal and the mat boundary|
+|cube_id|string|''|connect only to the cube whose BLE local name contains `cube_id`|
+|cube_address|string|''|connect only to the cube with this BLE address|
 
 Parameter files is stored in [params](params).
 And, [launch/toio_ros2_bringup.launch.py](launch/toio_ros2_bringup.launch.py) load [params/toio_a4_play_mat_params.yaml](params/toio_a4_play_mat_params.yaml) as default.
@@ -80,6 +85,38 @@ source ~/dev_ws/install/setup.bash
 ```bash
 ros2 launch toio_ros2 toio_ros2_bringup.launch.py
 ```
+
+## Connecting to a specific cube
+
+By default (`cube_id` and `cube_address` are empty), the node connects to the
+nearest cube found by the BLE scan. This is convenient when you have a single
+cube, but with other cubes around you may connect to somebody else's cube.
+
+To connect only to your own cube, set the `cube_id` parameter to the identifier
+contained in the cube's BLE local name. The name format depends on the cube,
+so take the `<cube_id>` part of whichever form your cube advertises:
+
+- `toio Core Cube-<cube_id>` (e.g. `toio Core Cube-C7f` -> `C7f`)
+- `toio-<cube_id> (toio Core Cube)` (e.g. `toio-a7D (toio Core Cube)` -> `a7D`)
+
+The name of every cube found by the scan is printed in the node log at startup,
+so you can find your `cube_id` there:
+
+```
+[INFO] [toio_ros2_node]: found cube: toio-a7D (toio Core Cube) (XXXXXXXX-...)
+```
+
+```bash
+ros2 run toio_ros2 toio_ros2_node --ros-args -p cube_id:=a7D
+```
+
+`cube_id` is matched as a substring of the BLE local name, so use enough
+characters to identify one cube: a short `cube_id` may match several cubes,
+and the nearest match is used.
+
+`cube_address` can be used instead to specify the BLE address directly, but
+note that it is platform dependent: a MAC address on Linux/Windows and a
+CoreBluetooth UUID on macOS. `cube_id` takes precedence when both are set.
 
 ## Teleop
 
