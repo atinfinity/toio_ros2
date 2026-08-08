@@ -331,10 +331,12 @@ class ToioNode(Node):
         elif self.cube_address:
             found = await BLEScanner.scan_with_address(address={self.cube_address})
         else:
-            # Auto-connect mode: scan for up to two cubes so that other
-            # cubes nearby can be reported. With a single powered cube this
-            # waits for the full scan timeout (5s) before connecting.
-            found = await BLEScanner.scan(2)
+            # Auto-connect mode: report the cubes nearby as cube_id
+            # candidates. num does not stop the scan early - toio.py only
+            # truncates the result list to num entries after the full scan
+            # timeout (5s) - so a small num hides cubes when more are
+            # powered (issue #18) and a large one costs nothing.
+            found = await BLEScanner.scan(10)
             for cube_info in found:
                 self.get_logger().info(
                     f'found cube: {cube_info.name} ({cube_info.device.address})')
