@@ -77,10 +77,11 @@ class ToioNode(Node):
         self.declare_parameter('goal_boundary_margin', 10)
 
         # Cube identification (issue #14). Both empty (default): connect to
-        # the nearest cube found by the scan. cube_id is the trailing part of
-        # the BLE local name 'toio Core Cube-XXX' and is platform independent;
-        # cube_address is a MAC address (Linux/Windows) or a CoreBluetooth
-        # UUID (macOS). cube_id takes precedence when both are set.
+        # the nearest cube found by the scan. cube_id is matched as a substring
+        # of the BLE local name, which is 'toio Core Cube-XXX' or
+        # 'toio-XXX (toio Core Cube)' depending on the cube, and is platform
+        # independent; cube_address is a MAC address (Linux/Windows) or a
+        # CoreBluetooth UUID (macOS). cube_id takes precedence when both are set.
         self.declare_parameter('cube_id', '')
         self.declare_parameter('cube_address', '')
 
