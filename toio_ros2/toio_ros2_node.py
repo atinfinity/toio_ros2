@@ -85,6 +85,11 @@ class ToioNode(Node):
         self.declare_parameter('cube_id', '')
         self.declare_parameter('cube_address', '')
 
+        # TF frame prefix for multi-cube setups (issue #15): the published
+        # transform becomes map -> <frame_prefix>center. Use the same value
+        # as the frame_prefix of robot_state_publisher (e.g. 'toio1/').
+        self.declare_parameter('frame_prefix', '')
+
         # Get params for field information
         self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
         self.field_max_x = self.get_parameter('field_max_x').get_parameter_value().double_value
@@ -105,6 +110,8 @@ class ToioNode(Node):
         self.cube_id = self.get_parameter('cube_id').get_parameter_value().string_value
         self.cube_address = self.get_parameter(
             'cube_address').get_parameter_value().string_value
+        self.frame_prefix = self.get_parameter(
+            'frame_prefix').get_parameter_value().string_value
 
         # calculate scale
         self.scale_x = self.field_width_meter / (self.field_max_x - self.field_min_x)
@@ -264,7 +271,7 @@ class ToioNode(Node):
         transform = TransformStamped()
         transform.header.stamp = self.get_clock().now().to_msg()
         transform.header.frame_id = 'map'
-        transform.child_frame_id = 'center'
+        transform.child_frame_id = self.frame_prefix + 'center'
         transform.transform.translation.x = x
         transform.transform.translation.y = y
         transform.transform.translation.z = 0.0

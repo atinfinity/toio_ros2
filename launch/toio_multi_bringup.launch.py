@@ -24,55 +24,56 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
+    """
+    Bring up two toio cubes in the namespaces toio1 and toio2.
+
+    Cube identification is mandatory in a multi-cube setup: without
+    cube1_id / cube2_id both nodes would race for the same cube.
+    """
     toio_ros2_dir = get_package_share_directory('toio_ros2')
-    rviz_config_dir = os.path.join(toio_ros2_dir, 'rviz')
-    rviz_config_file = os.path.join(rviz_config_dir, 'toio.rviz')
-    toio_description_dir = get_package_share_directory('toio_description')
+    bringup_launch_file = os.path.join(
+        toio_ros2_dir, 'launch', 'toio_ros2_bringup.launch.py')
+    rviz_config_file = os.path.join(toio_ros2_dir, 'rviz', 'toio_multi.rviz')
 
     params_file = LaunchConfiguration('params_file')
     use_rviz = LaunchConfiguration('use_rviz')
-    namespace = LaunchConfiguration('namespace')
-    cube_id = LaunchConfiguration('cube_id')
-    frame_prefix = LaunchConfiguration('frame_prefix')
+    cube1_id = LaunchConfiguration('cube1_id')
+    cube2_id = LaunchConfiguration('cube2_id')
 
     declare_params_file_cmd = DeclareLaunchArgument(
         'params_file',
         default_value=os.path.join(toio_ros2_dir, 'params', 'toio_a4_play_mat_params.yaml'),
-        description='Full path to the ROS2 parameters file to use toio_ros2 node')
+        description='Full path to the ROS2 parameters file shared by both cubes')
     declare_use_rviz_cmd = DeclareLaunchArgument(
         name='use_rviz',
         default_value='true',
         description='Use RViz2 if true')
-    declare_namespace_cmd = DeclareLaunchArgument(
-        name='namespace',
-        default_value='',
-        description='Namespace of the toio nodes and topics (e.g. toio1)')
-    declare_cube_id_cmd = DeclareLaunchArgument(
-        name='cube_id',
-        default_value='',
-        description='Connect only to the cube whose BLE local name contains cube_id')
-    declare_frame_prefix_cmd = DeclareLaunchArgument(
-        name='frame_prefix',
-        default_value='',
-        description='TF frame prefix of this cube (e.g. "toio1/")')
+    declare_cube1_id_cmd = DeclareLaunchArgument(
+        name='cube1_id',
+        description='cube_id of the first cube (a substring of its BLE local name)')
+    declare_cube2_id_cmd = DeclareLaunchArgument(
+        name='cube2_id',
+        description='cube_id of the second cube (a substring of its BLE local name)')
 
-    toio_ros2_node = Node(
-        package='toio_ros2',
-        executable='toio_ros2_node',
-        name='toio_ros2_node',
-        namespace=namespace,
-        parameters=[
-            params_file,
-            {'cube_id': cube_id, 'frame_prefix': frame_prefix}],
-        output='screen')
-
-    toio_description_node = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(toio_description_dir, 'launch', 'robot_description.launch.py')
-        ),
+    toio1_bringup = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(bringup_launch_file),
         launch_arguments={
-            'namespace': namespace,
-            'frame_prefix': frame_prefix,
+            'namespace': 'toio1',
+            'cube_id': cube1_id,
+            'frame_prefix': 'toio1/',
+            'params_file': params_file,
+            'use_rviz': 'false',
+        }.items()
+    )
+
+    toio2_bringup = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(bringup_launch_file),
+        launch_arguments={
+            'namespace': 'toio2',
+            'cube_id': cube2_id,
+            'frame_prefix': 'toio2/',
+            'params_file': params_file,
+            'use_rviz': 'false',
         }.items()
     )
 
@@ -87,11 +88,10 @@ def generate_launch_description():
     ld = LaunchDescription()
     ld.add_action(declare_params_file_cmd)
     ld.add_action(declare_use_rviz_cmd)
-    ld.add_action(declare_namespace_cmd)
-    ld.add_action(declare_cube_id_cmd)
-    ld.add_action(declare_frame_prefix_cmd)
+    ld.add_action(declare_cube1_id_cmd)
+    ld.add_action(declare_cube2_id_cmd)
 
-    ld.add_action(toio_ros2_node)
-    ld.add_action(toio_description_node)
+    ld.add_action(toio1_bringup)
+    ld.add_action(toio2_bringup)
     ld.add_action(rviz2_node)
     return ld

@@ -184,6 +184,18 @@ def test_position_id_missed_is_not_published(node):
     node.tf_broadcaster.sendTransform.assert_not_called()
 
 
+def test_toio_transform_uses_frame_prefix(node):
+    # default: no prefix
+    transform = node.make_toio_transform(0.1, -0.1, 0.0, 0.0, 0.0, 1.0)
+    assert transform.child_frame_id == 'center'
+
+    # multi-cube setup: prefixed child frame, shared map frame
+    node.frame_prefix = 'toio1/'
+    transform = node.make_toio_transform(0.1, -0.1, 0.0, 0.0, 0.0, 1.0)
+    assert transform.header.frame_id == 'map'
+    assert transform.child_frame_id == 'toio1/center'
+
+
 def test_battery_notification_publishes_level(node):
     node.toio_battery_level_pub = MagicMock()
 
