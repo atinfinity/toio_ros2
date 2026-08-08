@@ -29,6 +29,12 @@ from toio import (Battery, BLEScanner, CubeLocation, IdInformation, Motor,
                   ResponseMotorControlTarget, RotationOption, Speed,
                   SpeedChangeType, TargetPosition, ToioCoreCube)
 
+# Auto-connect mode reports up to this many nearby cubes as cube_id
+# candidates. BLEScanner.scan(num) never stops early at num cubes (toio.py
+# only truncates the result list after the full 5s scan timeout), so a
+# larger value costs nothing while a small one hides cubes (issue #18).
+AUTO_CONNECT_SCAN_NUM = 10
+
 
 class ToioNode(Node):
     def __init__(self) -> None:
@@ -332,11 +338,8 @@ class ToioNode(Node):
             found = await BLEScanner.scan_with_address(address={self.cube_address})
         else:
             # Auto-connect mode: report the cubes nearby as cube_id
-            # candidates. num does not stop the scan early - toio.py only
-            # truncates the result list to num entries after the full scan
-            # timeout (5s) - so a small num hides cubes when more are
-            # powered (issue #18) and a large one costs nothing.
-            found = await BLEScanner.scan(10)
+            # candidates (see AUTO_CONNECT_SCAN_NUM).
+            found = await BLEScanner.scan(AUTO_CONNECT_SCAN_NUM)
             for cube_info in found:
                 self.get_logger().info(
                     f'found cube: {cube_info.name} ({cube_info.device.address})')
