@@ -50,10 +50,10 @@ def generate_launch_description():
         description='Use RViz2 if true')
     declare_cube1_id_cmd = DeclareLaunchArgument(
         name='cube1_id',
-        description='cube_id of the first cube ("toio Core Cube-<cube1_id>")')
+        description='cube_id of the first cube (a substring of its BLE local name)')
     declare_cube2_id_cmd = DeclareLaunchArgument(
         name='cube2_id',
-        description='cube_id of the second cube ("toio Core Cube-<cube2_id>")')
+        description='cube_id of the second cube (a substring of its BLE local name)')
 
     toio1_bringup = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(bringup_launch_file),

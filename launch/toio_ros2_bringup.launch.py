@@ -50,7 +50,7 @@ def generate_launch_description():
     declare_cube_id_cmd = DeclareLaunchArgument(
         name='cube_id',
         default_value='',
-        description='Connect only to the cube named "toio Core Cube-<cube_id>"')
+        description='Connect only to the cube whose BLE local name contains cube_id')
     declare_frame_prefix_cmd = DeclareLaunchArgument(
         name='frame_prefix',
         default_value='',

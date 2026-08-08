@@ -127,7 +127,7 @@ and `toio2`. Specifying `cube_id` of every cube is mandatory here — without
 it the two nodes would race for the same cube:
 
 ```bash
-ros2 launch toio_ros2 toio_multi_bringup.launch.py cube1_id:=C7f cube2_id:=p9G
+ros2 launch toio_ros2 toio_multi_bringup.launch.py cube1_id:=a7D cube2_id:=A8e
 ```
 
 Topics are namespaced (`/toio1/cmd_vel`, `/toio1/toio/pose`, ...) and TF uses
