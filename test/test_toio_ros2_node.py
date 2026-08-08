@@ -24,7 +24,7 @@ import rclpy
 from tf_transformations import euler_from_quaternion
 from toio.device_interface import CubeInfo
 
-from toio_ros2.toio_ros2_node import ToioNode
+from toio_ros2.toio_ros2_node import AUTO_CONNECT_SCAN_NUM, ToioNode
 
 
 @pytest.fixture
@@ -270,7 +270,7 @@ def test_scan_toio_auto_mode_picks_nearest(node, monkeypatch):
 
     # default: cube_id and cube_address are both empty
     assert asyncio.run(node.scan_toio()) is nearest
-    scanner.scan.assert_awaited_once_with(2)
+    scanner.scan.assert_awaited_once_with(AUTO_CONNECT_SCAN_NUM)
 
 
 def test_scan_toio_returns_none_when_not_found(node, monkeypatch):
