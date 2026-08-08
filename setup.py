@@ -8,7 +8,7 @@ package_name = 'toio_ros2'
 
 setup(
     name=package_name,
-    version='1.0.0',
+    version='3.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
