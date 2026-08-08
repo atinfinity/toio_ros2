@@ -16,7 +16,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -55,27 +55,39 @@ def generate_launch_description():
         name='cube2_id',
         description='cube_id of the second cube (a substring of its BLE local name)')
 
-    toio1_bringup = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(bringup_launch_file),
-        launch_arguments={
-            'namespace': 'toio1',
-            'cube_id': cube1_id,
-            'frame_prefix': 'toio1/',
-            'params_file': params_file,
-            'use_rviz': 'false',
-        }.items()
-    )
+    # Each include is wrapped in a scoped GroupAction because the
+    # launch_arguments of IncludeLaunchDescription overwrite the parent's
+    # launch configurations: without the scope, 'use_rviz': 'false' below
+    # leaks out and the rviz2_node condition always evaluates to false.
+    toio1_bringup = GroupAction(
+        scoped=True,
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(bringup_launch_file),
+                launch_arguments={
+                    'namespace': 'toio1',
+                    'cube_id': cube1_id,
+                    'frame_prefix': 'toio1/',
+                    'params_file': params_file,
+                    'use_rviz': 'false',
+                }.items()
+            ),
+        ])
 
-    toio2_bringup = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(bringup_launch_file),
-        launch_arguments={
-            'namespace': 'toio2',
-            'cube_id': cube2_id,
-            'frame_prefix': 'toio2/',
-            'params_file': params_file,
-            'use_rviz': 'false',
-        }.items()
-    )
+    toio2_bringup = GroupAction(
+        scoped=True,
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(bringup_launch_file),
+                launch_arguments={
+                    'namespace': 'toio2',
+                    'cube_id': cube2_id,
+                    'frame_prefix': 'toio2/',
+                    'params_file': params_file,
+                    'use_rviz': 'false',
+                }.items()
+            ),
+        ])
 
     rviz2_node = Node(
         condition=IfCondition(use_rviz),
