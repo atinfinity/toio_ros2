@@ -22,7 +22,6 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
-from std_msgs.msg import Float32
 from tf2_ros import TransformBroadcaster
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 from toio import (Battery, BLEScanner, CubeLocation, IdInformation, Motor,
@@ -152,8 +151,6 @@ class ToioNode(Node):
 
         # publisher
         self.toio_pose_pub = self.create_publisher(PoseStamped, 'toio/pose', qos_profile=10)
-        self.toio_battery_level_pub = self.create_publisher(
-            Float32, 'toio/battery_level', qos_profile=10)
         self.toio_battery_state_pub = self.create_publisher(
             BatteryState, 'toio/battery_state', qos_profile=10)
 
@@ -309,12 +306,8 @@ class ToioNode(Node):
         if info is None:
             return
 
-        # battery_level is a percentage notified in discrete steps
-        # (10/20/50/100): https://toio.github.io/toio-spec/docs/ble_battery
-        battery_level_msg = Float32()
-        battery_level_msg.data = float(info.battery_level)
-        self.toio_battery_level_pub.publish(battery_level_msg)
-
+        # battery_level is a percentage notified in 10% steps (0-100):
+        # https://toio.github.io/toio-spec/docs/ble_battery
         battery_state_msg = BatteryState()
         battery_state_msg.header.stamp = self.get_clock().now().to_msg()
         battery_state_msg.percentage = float(info.battery_level) / 100.0

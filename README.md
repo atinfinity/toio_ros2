@@ -34,8 +34,7 @@ I checked this package on the following environment.
 |topic name|Type|Description|
 |:---|:---|:---|
 |/toio/pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|toio pose in map frame|
-|/toio/battery_level|[std_msgs/msg/Float32](https://docs.ros2.org/foxy/api/std_msgs/msg/Float32.html)|battery level of toio in percent. The cube notifies it in 10% steps (0-100), see the [toio spec](https://toio.github.io/toio-spec/docs/ble_battery)|
-|/toio/battery_state|[sensor_msgs/msg/BatteryState](https://docs.ros2.org/foxy/api/sensor_msgs/msg/BatteryState.html)|same battery level as a standard `BatteryState` (`percentage` is 0.0-1.0)|
+|/toio/battery_state|[sensor_msgs/msg/BatteryState](https://docs.ros2.org/foxy/api/sensor_msgs/msg/BatteryState.html)|battery level of toio (`percentage` is 0.0-1.0). The cube notifies it in 10% steps, see the [toio spec](https://toio.github.io/toio-spec/docs/ble_battery)|
 |/tf|-|a valid transform from `map` to `center`|
 
 ## Parameters
