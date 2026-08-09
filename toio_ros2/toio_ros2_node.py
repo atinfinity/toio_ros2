@@ -597,6 +597,21 @@ class ToioNode(Node):
                 self.get_logger().warn(f'failed to turn off led/sound: {e}')
             await self.cube.disconnect()
 
+    async def cancel_pending_tasks(self) -> None:
+        """Cancel every coroutine still running on the loop and await them."""
+        # Resident loops only leave on their own when the rclpy context is
+        # already down (a SIGINT does that before destroy_node() runs), so
+        # stopping the loop without cancelling leaves them pending and asyncio
+        # reports 'Task was destroyed but it is pending!' for each one.
+        # all_tasks() also covers the reconnection and the one-shot goal_pose /
+        # sound coroutines, which no bookkeeping list would keep up with.
+        current = asyncio.current_task()
+        pending = [task for task in asyncio.all_tasks() if task is not current]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
     def destroy_node(self):
         try:
             future = asyncio.run_coroutine_threadsafe(
@@ -605,6 +620,15 @@ class ToioNode(Node):
             future.result(timeout=5.0)
         except Exception as e:
             self.get_logger().warn(f'toio shutdown failed: {e}')
+        # after shutdown_toio(), so that the motor stop / indicator off /
+        # disconnect are not cancelled along with the resident loops
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.cancel_pending_tasks(),
+                self.loop)
+            future.result(timeout=2.0)
+        except Exception as e:
+            self.get_logger().warn(f'failed to cancel background tasks: {e}')
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(timeout=2.0)
         super().destroy_node()
