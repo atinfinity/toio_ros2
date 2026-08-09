@@ -27,14 +27,14 @@ I checked this package on the following environment.
 |topic name|Type|Description|
 |:---|:---|:---|
 |/cmd_vel|[geometry_msgs/msg/Twist](https://docs.ros2.org/foxy/api/geometry_msgs/msg/Twist.html)|desired robot velocity|
-|/goal_pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|desired robot pose|
+|/goal_pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|desired robot pose (cube built-in target motion; disabled when `enable_goal_pose_motion` is false)|
 
 ## Published topics
 
 |topic name|Type|Description|
 |:---|:---|:---|
 |/toio/pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|toio pose in map frame|
-|/toio/battery_level|[std_msgs/msg/Float32](https://docs.ros2.org/foxy/api/std_msgs/msg/Float32.html)|battery level of toio|
+|/toio/battery_state|[sensor_msgs/msg/BatteryState](https://docs.ros2.org/foxy/api/sensor_msgs/msg/BatteryState.html)|battery level of toio (`percentage` is 0.0-1.0). The cube notifies it in 10% steps, see the [toio spec](https://toio.github.io/toio-spec/docs/ble_battery)|
 |/tf|-|a valid transform from `map` to `center`|
 
 ## Parameters
@@ -56,6 +56,7 @@ Please see <https://toio.github.io/toio-spec/docs/hardware_position_id> in detai
 |cube_id|string|''|connect only to the cube whose BLE local name contains `cube_id`|
 |cube_address|string|''|connect only to the cube with this BLE address|
 |frame_prefix|string|''|prefix of the TF child frame (`<frame_prefix>center`) for multi-cube setups|
+|enable_goal_pose_motion|bool|true|subscribe `goal_pose` and use the cube built-in target motion. Set to false when an external traffic authority (e.g. Open-RMF) owns the motion plan and all movement must go through Nav2 `cmd_vel`|
 
 Parameter files is stored in [params](params).
 And, [launch/toio_ros2_bringup.launch.py](launch/toio_ros2_bringup.launch.py) load [params/toio_a4_play_mat_params.yaml](params/toio_a4_play_mat_params.yaml) as default.
@@ -122,7 +123,10 @@ CoreBluetooth UUID on macOS. `cube_id` takes precedence when both are set.
 ## Using multiple cubes
 
 Each cube is handled by its own node instance separated by a ROS namespace.
-`toio_multi_bringup.launch.py` brings up two cubes in the namespaces `toio1`
+`toio_multi_bringup.launch.py` brings up one cube per namespace listed in
+the `robots` argument (default `toio1,toio2`). For three or more cubes
+pass `robots:=toio1,toio2,toio3 cube_ids:=a7D,A8e,B9f`. The example below
+brings up two cubes in the namespaces `toio1`
 and `toio2`. Specifying `cube_id` of every cube is mandatory here — without
 it the two nodes would race for the same cube:
 

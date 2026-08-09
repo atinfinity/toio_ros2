@@ -21,7 +21,7 @@ from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from sensor_msgs.msg import BatteryState
 from tf2_ros import TransformBroadcaster
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 from toio import (Battery, BLEScanner, CubeLocation, IdInformation, Motor,
@@ -96,6 +96,12 @@ class ToioNode(Node):
         # as the frame_prefix of robot_state_publisher (e.g. 'toio1/').
         self.declare_parameter('frame_prefix', '')
 
+        # The cube's built-in target motion (goal_pose topic) moves the cube
+        # on a path that no external planner knows about. Disable it when an
+        # external traffic authority (e.g. Open-RMF) owns the motion plan and
+        # all movement must go through Nav2 cmd_vel instead.
+        self.declare_parameter('enable_goal_pose_motion', True)
+
         # Get params for field information
         self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
         self.field_max_x = self.get_parameter('field_max_x').get_parameter_value().double_value
@@ -118,6 +124,8 @@ class ToioNode(Node):
             'cube_address').get_parameter_value().string_value
         self.frame_prefix = self.get_parameter(
             'frame_prefix').get_parameter_value().string_value
+        self.enable_goal_pose_motion = self.get_parameter(
+            'enable_goal_pose_motion').get_parameter_value().bool_value
 
         # calculate scale
         self.scale_x = self.field_width_meter / (self.field_max_x - self.field_min_x)
@@ -130,16 +138,21 @@ class ToioNode(Node):
             'cmd_vel',
             self.cmd_vel_callback,
             10)
-        self.goal_pose_sub = self.create_subscription(
-            PoseStamped,
-            'goal_pose',
-            self.goal_pose_callback,
-            10)
+        if self.enable_goal_pose_motion:
+            self.goal_pose_sub = self.create_subscription(
+                PoseStamped,
+                'goal_pose',
+                self.goal_pose_callback,
+                10)
+        else:
+            self.goal_pose_sub = None
+            self.get_logger().info(
+                'goal_pose motion is disabled (enable_goal_pose_motion=false)')
 
         # publisher
         self.toio_pose_pub = self.create_publisher(PoseStamped, 'toio/pose', qos_profile=10)
-        self.toio_battery_level_pub = self.create_publisher(
-            Float32, 'toio/battery_level', qos_profile=10)
+        self.toio_battery_state_pub = self.create_publisher(
+            BatteryState, 'toio/battery_state', qos_profile=10)
 
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -293,9 +306,17 @@ class ToioNode(Node):
         if info is None:
             return
 
-        battery_level_msg = Float32()
-        battery_level_msg.data = float(info.battery_level)
-        self.toio_battery_level_pub.publish(battery_level_msg)
+        # battery_level is a percentage notified in 10% steps (0-100):
+        # https://toio.github.io/toio-spec/docs/ble_battery
+        battery_state_msg = BatteryState()
+        battery_state_msg.header.stamp = self.get_clock().now().to_msg()
+        battery_state_msg.percentage = float(info.battery_level) / 100.0
+        battery_state_msg.present = True
+        battery_state_msg.power_supply_status = \
+            BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
+        battery_state_msg.power_supply_technology = \
+            BatteryState.POWER_SUPPLY_TECHNOLOGY_LIPO
+        self.toio_battery_state_pub.publish(battery_state_msg)
         self.get_logger().debug(f'battery_level = {info.battery_level}')
 
     def _on_motor_notification(self, payload: bytearray) -> None:

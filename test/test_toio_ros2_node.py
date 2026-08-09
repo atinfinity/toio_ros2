@@ -196,14 +196,15 @@ def test_toio_transform_uses_frame_prefix(node):
     assert transform.child_frame_id == 'toio1/center'
 
 
-def test_battery_notification_publishes_level(node):
-    node.toio_battery_level_pub = MagicMock()
+def test_battery_notification_publishes_state(node):
+    node.toio_battery_state_pub = MagicMock()
 
     node._on_battery_notification(bytearray([80]))
 
-    node.toio_battery_level_pub.publish.assert_called_once()
-    msg = node.toio_battery_level_pub.publish.call_args[0][0]
-    assert msg.data == pytest.approx(80.0)
+    node.toio_battery_state_pub.publish.assert_called_once()
+    msg = node.toio_battery_state_pub.publish.call_args[0][0]
+    assert msg.percentage == pytest.approx(0.8)
+    assert msg.present is True
 
 
 def test_motor_notification_accepts_target_responses(node):
