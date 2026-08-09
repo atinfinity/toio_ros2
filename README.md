@@ -28,6 +28,8 @@ I checked this package on the following environment.
 |:---|:---|:---|
 |/cmd_vel|[geometry_msgs/msg/Twist](https://docs.ros2.org/foxy/api/geometry_msgs/msg/Twist.html)|desired robot velocity|
 |/goal_pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|desired robot pose (cube built-in target motion; disabled when `enable_goal_pose_motion` is false)|
+|/toio/led|[std_msgs/msg/ColorRGBA](https://docs.ros2.org/foxy/api/std_msgs/msg/ColorRGBA.html)|indicator color. `r`/`g`/`b` are 0.0-1.0 and scaled to the cube range of 0-255 (`a` is unused); all zero turns the indicator off|
+|/toio/sound|[std_msgs/msg/UInt8](https://docs.ros2.org/foxy/api/std_msgs/msg/UInt8.html)|[sound effect ID](https://toio.github.io/toio-spec/docs/ble_sound) (0-10). An out-of-range ID is ignored with a warning|
 
 ## Published topics
 
@@ -57,6 +59,8 @@ Please see <https://toio.github.io/toio-spec/docs/hardware_position_id> in detai
 |cube_address|string|''|connect only to the cube with this BLE address|
 |frame_prefix|string|''|prefix of the TF child frame (`<frame_prefix>center`) for multi-cube setups|
 |enable_goal_pose_motion|bool|true|subscribe `goal_pose` and use the cube built-in target motion. Set to false when an external traffic authority (e.g. Open-RMF) owns the motion plan and all movement must go through Nav2 `cmd_vel`|
+|led_duration_ms|int|0|lighting time of `/toio/led`. 0 keeps the indicator lit until the next command, 10-2550 lets the cube turn it off on its own (a fraction below 10ms is truncated, anything above 2550ms is clipped)|
+|sound_volume|int|255|volume of `/toio/sound` (0 is mute, 1-255)|
 
 Parameter files is stored in [params](params).
 And, [launch/toio_ros2_bringup.launch.py](launch/toio_ros2_bringup.launch.py) load [params/toio_a4_play_mat_params.yaml](params/toio_a4_play_mat_params.yaml) as default.
@@ -151,6 +155,25 @@ with a unique `namespace` / `cube_id` / `frame_prefix`, following
 ```bash
 ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p speed:=0.1 -p turn:=3.0
 ```
+
+## LED and sound
+
+```bash
+# light the indicator in red
+ros2 topic pub --once /toio/led std_msgs/msg/ColorRGBA "{r: 1.0, g: 0.0, b: 0.0, a: 1.0}"
+
+# play the 'Get1' sound effect
+ros2 topic pub --once /toio/sound std_msgs/msg/UInt8 "{data: 6}"
+
+# turn the indicator off
+ros2 topic pub --once /toio/led std_msgs/msg/ColorRGBA "{r: 0.0, g: 0.0, b: 0.0, a: 0.0}"
+```
+
+Both topics are relative names, so with `toio_multi_bringup.launch.py` they are
+namespaced per cube (`/toio1/toio/led`, `/toio2/toio/led`, ...).
+The sound effect IDs are the ones of the
+[toio spec](https://toio.github.io/toio-spec/docs/ble_sound) (0:Enter, 1:Selected,
+2:Cancel, 3:Cursor, 4:MatIn, 5:MatOut, 6:Get1, 7:Get2, 8:Get3, 9:Effect1, 10:Effect2).
 
 ## Frame
 
