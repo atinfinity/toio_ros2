@@ -138,11 +138,7 @@ def test_cmd_vel_rotation_is_symmetric(node):
     assert right > 0
 
 
-def test_goal_pose_ignored_when_disconnected(node, monkeypatch):
-    scheduled = []
-    monkeypatch.setattr(
-        'toio_ros2.toio_ros2_node.asyncio.run_coroutine_threadsafe',
-        lambda coro, loop: (scheduled.append(coro), coro.close()))
+def test_goal_pose_ignored_when_disconnected(node, scheduled):
     node.goal_pose_callback(PoseStamped())
     assert not scheduled
 
@@ -339,6 +335,54 @@ def test_shutdown_disconnects_even_if_turning_off_fails(node):
     node.cube.disconnect.assert_awaited_once()
 
 
+def test_cancel_pending_tasks_cancels_the_resident_loops(node):
+    async def resident():
+        while True:
+            await asyncio.sleep(3600)
+
+    async def scenario():
+        tasks = [asyncio.ensure_future(resident()) for _ in range(3)]
+        await asyncio.sleep(0)  # let them reach the first await
+        await node.cancel_pending_tasks()
+        return tasks
+
+    tasks = asyncio.run(scenario())
+
+    assert all(task.cancelled() for task in tasks)
+
+
+def test_cancel_pending_tasks_does_not_cancel_itself(node):
+    async def scenario():
+        await node.cancel_pending_tasks()
+        # reached only when cancel_pending_tasks() left its own task alone
+        return True
+
+    assert asyncio.run(scenario()) is True
+
+
+def test_destroy_node_cancels_pending_tasks_after_shutdown(node, monkeypatch):
+    calls = []
+
+    def fake_run_coroutine_threadsafe(coro, loop):
+        calls.append(coro.__name__)
+        coro.close()
+        return MagicMock()
+
+    monkeypatch.setattr(
+        'toio_ros2.toio_ros2_node.asyncio.run_coroutine_threadsafe',
+        fake_run_coroutine_threadsafe)
+    # keep the real loop running: the node fixture destroys the node again on
+    # teardown, and a stopped loop would make that call wait out its timeouts
+    monkeypatch.setattr(node, 'loop', MagicMock())
+    monkeypatch.setattr(node, 'thread', MagicMock())
+
+    node.destroy_node()
+    monkeypatch.undo()
+
+    # the cube cleanup must not be cancelled along with the resident loops
+    assert calls == ['shutdown_toio', 'cancel_pending_tasks']
+
+
 def test_position_id_notification_publishes_pose(node):
     node.toio_pose_pub = MagicMock()
     node.tf_broadcaster = MagicMock()
@@ -470,18 +514,7 @@ def test_scan_toio_returns_none_when_not_found(node, monkeypatch):
     assert asyncio.run(node.scan_toio()) is None
 
 
-def test_schedule_reconnect_runs_only_once(node, monkeypatch):
-    scheduled = []
-
-    def fake_run_coroutine_threadsafe(coro, loop):
-        scheduled.append(coro)
-        coro.close()
-        return MagicMock()
-
-    monkeypatch.setattr(
-        'toio_ros2.toio_ros2_node.asyncio.run_coroutine_threadsafe',
-        fake_run_coroutine_threadsafe)
-
+def test_schedule_reconnect_runs_only_once(node, scheduled):
     node.is_connected = True
     node._schedule_reconnect()
     node._schedule_reconnect()
