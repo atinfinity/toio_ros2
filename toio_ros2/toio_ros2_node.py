@@ -22,12 +22,14 @@ import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
+from std_msgs.msg import ColorRGBA, UInt8
 from tf2_ros import TransformBroadcaster
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
-from toio import (Battery, BLEScanner, CubeLocation, IdInformation, Motor,
-                  MotorResponseCode, MovementType, Point, PositionId,
-                  ResponseMotorControlTarget, RotationOption, Speed,
-                  SpeedChangeType, TargetPosition, ToioCoreCube)
+from toio import (Battery, BLEScanner, Color, CubeLocation, IdInformation,
+                  IndicatorParam, Motor, MotorResponseCode, MovementType,
+                  Point, PositionId, ResponseMotorControlTarget,
+                  RotationOption, SoundId, Speed, SpeedChangeType,
+                  TargetPosition, ToioCoreCube)
 
 # Auto-connect mode reports up to this many nearby cubes as cube_id
 # candidates. BLEScanner.scan(num) never stops early at num cubes (toio.py
@@ -67,6 +69,20 @@ class ToioNode(Node):
         self._latest_cmd_vel_stamp: float = 0.0
         self.cmd_vel_timeout = 0.5  # seconds, matches motor duration_ms=500
 
+        # Latest-command-only pattern for the indicator (issue #28), the same
+        # as cmd_vel: a fast publisher must not queue up BLE writes behind the
+        # 20Hz motor loop. The color is a state rather than an event, so the
+        # newest one is coalesced instead of dropped -- dropping an 'off'
+        # command would leave the cube lit for good.
+        self._pending_led: tuple = None
+        self._last_led_cmd: tuple = None
+        self.led_write_interval = 0.1  # seconds
+
+        # A sound is an event and cannot be coalesced, so commands arriving
+        # faster than this are dropped instead
+        self.sound_min_interval = 0.1  # seconds
+        self._last_sound_time: float = 0.0
+
         # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
         self.declare_parameter('field_min_x', 98.0)
         self.declare_parameter('field_max_x', 402.0)
@@ -102,6 +118,15 @@ class ToioNode(Node):
         # all movement must go through Nav2 cmd_vel instead.
         self.declare_parameter('enable_goal_pose_motion', True)
 
+        # Visual / audible feedback (issue #28). led_duration_ms 0 keeps the
+        # indicator lit until the next command; 10-2550 lets the cube turn it
+        # off on its own (a fraction below 10ms is truncated and anything above
+        # 2550ms is clipped by toio.py). sound_volume is mute or full volume
+        # only, as the cube takes 0 as mute and every other value as the
+        # maximum volume.
+        self.declare_parameter('led_duration_ms', 0)
+        self.declare_parameter('sound_volume', 255)
+
         # Get params for field information
         self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
         self.field_max_x = self.get_parameter('field_max_x').get_parameter_value().double_value
@@ -126,6 +151,10 @@ class ToioNode(Node):
             'frame_prefix').get_parameter_value().string_value
         self.enable_goal_pose_motion = self.get_parameter(
             'enable_goal_pose_motion').get_parameter_value().bool_value
+        self.led_duration_ms = self.get_parameter(
+            'led_duration_ms').get_parameter_value().integer_value
+        self.sound_volume = self.get_parameter(
+            'sound_volume').get_parameter_value().integer_value
 
         # calculate scale
         self.scale_x = self.field_width_meter / (self.field_max_x - self.field_min_x)
@@ -148,6 +177,16 @@ class ToioNode(Node):
             self.goal_pose_sub = None
             self.get_logger().info(
                 'goal_pose motion is disabled (enable_goal_pose_motion=false)')
+        self.led_sub = self.create_subscription(
+            ColorRGBA,
+            'toio/led',
+            self.led_callback,
+            10)
+        self.sound_sub = self.create_subscription(
+            UInt8,
+            'toio/sound',
+            self.sound_callback,
+            10)
 
         # publisher
         self.toio_pose_pub = self.create_publisher(PoseStamped, 'toio/pose', qos_profile=10)
@@ -170,6 +209,9 @@ class ToioNode(Node):
             self.loop)
         asyncio.run_coroutine_threadsafe(
             self.motor_command_loop(),
+            self.loop)
+        asyncio.run_coroutine_threadsafe(
+            self.led_command_loop(),
             self.loop)
 
     def start_loop(self) -> None:
@@ -219,6 +261,46 @@ class ToioNode(Node):
         asyncio.run_coroutine_threadsafe(
             self.motor_control_target(x, y, angle),
             self.loop)
+
+    def led_callback(self, msg: ColorRGBA) -> None:
+        if not self.is_connected:
+            return
+
+        # ColorRGBA is 0.0-1.0 while the cube takes 0-255; alpha is unused.
+        # tuple assignment is atomic, read by led_command_loop()
+        self._pending_led = (self.to_led_value(msg.r),
+                             self.to_led_value(msg.g),
+                             self.to_led_value(msg.b))
+
+    def sound_callback(self, msg: UInt8) -> None:
+        if not self.is_connected:
+            return
+
+        try:
+            sound_id = SoundId(msg.data)
+        except ValueError:
+            self.get_logger().warn(
+                f'unknown sound effect id {msg.data}, '
+                f'expected 0-{int(max(SoundId))}')
+            return
+
+        now = time.monotonic()
+        if now - self._last_sound_time < self.sound_min_interval:
+            self.get_logger().debug('sound command throttled')
+            return
+        self._last_sound_time = now
+
+        asyncio.run_coroutine_threadsafe(
+            self.play_sound(sound_id),
+            self.loop)
+
+    @staticmethod
+    def to_led_value(value: float) -> int:
+        # NaN / inf from a malformed message would raise on int() and kill the
+        # subscriber callback, so they are treated as "off" instead
+        if not math.isfinite(value):
+            return 0
+        return max(min(int(round(value * 255.0)), 255), 0)
 
     def linear_speed_to_rpm(self, v_lin: float) -> float:
         return (v_lin / (2.0 * math.pi * self.wheel_radius)) * 60.0
@@ -390,6 +472,10 @@ class ToioNode(Node):
                     self._on_battery_notification)
                 await self.cube.api.motor.register_notification_handler(
                     self._on_motor_notification)
+                # the indicator state after a reconnection is not guaranteed to
+                # match the last requested color, so let led_command_loop()
+                # write it again (an identical write is harmless)
+                self._last_led_cmd = None
                 self.is_connected = True
                 self.get_logger().info(
                     f'toio is connected: {cube_info.name} ({cube_info.device.address})')
@@ -448,14 +534,67 @@ class ToioNode(Node):
             ),
         )
 
+    async def led_command_loop(self) -> None:
+        # Resident sender: writes the newest color at a bounded rate so BLE
+        # writes never queue up behind a fast publisher
+        while rclpy.ok():
+            await asyncio.sleep(self.led_write_interval)
+            await self.flush_led()
+
+    async def flush_led(self) -> None:
+        if not self.is_connected:
+            return
+
+        cmd = self._pending_led
+        # the indicator holds its state, so an unchanged color needs no write
+        if cmd is None or cmd == self._last_led_cmd:
+            return
+
+        try:
+            await self.set_indicator(*cmd)
+        except Exception as e:
+            # keep _last_led_cmd untouched so the color is retried next tick
+            self.get_logger().warn(f'led command failed: {e}')
+            return
+        self._last_led_cmd = cmd
+
+    async def set_indicator(self, r, g, b) -> None:
+        if (r, g, b) == (0, 0, 0):
+            await self.cube.api.indicator.turn_off_all()
+        else:
+            await self.cube.api.indicator.turn_on(
+                IndicatorParam(
+                    duration_ms=self.led_duration_ms,
+                    color=Color(r=r, g=g, b=b)))
+
+    async def play_sound(self, sound_id: SoundId) -> None:
+        # Nobody awaits the future returned by run_coroutine_threadsafe, so an
+        # escaping exception would only show up as a stray 'Future exception
+        # was never retrieved' message with no context
+        try:
+            await self.cube.api.sound.play_sound_effect(sound_id, self.sound_volume)
+        except Exception as e:
+            self.get_logger().warn(f'sound command failed: {e}')
+
     async def shutdown_toio(self) -> None:
         if self.is_connected:
             self.is_connected = False  # stop motor_command_loop / watchdog sends
-            await self.cube.api.motor.motor_control(0, 0)
-            # passing None unregisters all handlers
+            # Unregister before the cleanup writes below: a SIGINT shuts the
+            # rclpy context down before destroy_node() runs (see main()), so a
+            # notification arriving while those BLE round-trips are in flight
+            # would publish on an invalid context and raise.
+            # Passing None unregisters all handlers.
             await self.cube.api.id_information.unregister_notification_handler(None)
             await self.cube.api.battery.unregister_notification_handler(None)
             await self.cube.api.motor.unregister_notification_handler(None)
+            await self.cube.api.motor.motor_control(0, 0)
+            # do not leave the cube lit or buzzing after the node exits, but
+            # keep disconnecting when the cube no longer answers
+            try:
+                await self.cube.api.indicator.turn_off_all()
+                await self.cube.api.sound.stop()
+            except Exception as e:
+                self.get_logger().warn(f'failed to turn off led/sound: {e}')
             await self.cube.disconnect()
 
     def destroy_node(self):

@@ -21,7 +21,9 @@ from unittest.mock import AsyncMock, MagicMock
 from geometry_msgs.msg import PoseStamped, Twist
 import pytest
 import rclpy
+from std_msgs.msg import ColorRGBA, UInt8
 from tf_transformations import euler_from_quaternion
+from toio import SoundId
 from toio.device_interface import CubeInfo
 
 from toio_ros2.toio_ros2_node import AUTO_CONNECT_SCAN_NUM, ToioNode
@@ -40,6 +42,26 @@ def node(monkeypatch):
     yield node
     node.destroy_node()
     rclpy.shutdown()
+
+
+@pytest.fixture
+def scheduled(monkeypatch):
+    """Capture the coroutines a callback hands to the asyncio loop thread."""
+    coros = []
+
+    def fake_run_coroutine_threadsafe(coro, loop):
+        coros.append(coro)
+        return MagicMock()
+
+    monkeypatch.setattr(
+        'toio_ros2.toio_ros2_node.asyncio.run_coroutine_threadsafe',
+        fake_run_coroutine_threadsafe)
+    yield coros
+    # the patch must be gone before the node fixture calls destroy_node(),
+    # otherwise its shutdown coroutine is captured here and never awaited
+    monkeypatch.undo()
+    for coro in coros:
+        coro.close()
 
 
 def make_position_id_payload(x, y, angle):
@@ -152,6 +174,169 @@ def test_motor_control_stop_not_resent(node):
     asyncio.run(node.motor_control(0, 0))
     # one drive command and one stop; the second stop is deduplicated
     assert node.cube.api.motor.motor_control.await_count == 2
+
+
+def test_led_ignored_when_disconnected(node):
+    node.led_callback(ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0))
+    assert node._pending_led is None
+
+
+def test_sound_ignored_when_disconnected(node, scheduled):
+    node.sound_callback(UInt8(data=int(SoundId.Get1)))
+    assert not scheduled
+
+
+def test_led_scales_color_to_cube_range(node):
+    node.is_connected = True
+    node.cube = MagicMock()
+    node.cube.api.indicator.turn_on = AsyncMock()
+
+    node.led_callback(ColorRGBA(r=1.0, g=0.0, b=0.5, a=1.0))
+    asyncio.run(node.flush_led())
+
+    param = node.cube.api.indicator.turn_on.call_args[0][0]
+    assert param.color.flatten() == (255, 0, 128)
+    assert param.duration_ms == node.led_duration_ms
+
+
+def test_led_clips_out_of_range_color(node):
+    node.is_connected = True
+
+    # NaN would raise on int() inside the callback if it were not filtered
+    node.led_callback(ColorRGBA(r=1.5, g=-0.2, b=float('nan'), a=1.0))
+
+    assert node._pending_led == (255, 0, 0)
+
+
+def test_led_all_zero_turns_the_indicator_off(node):
+    node.is_connected = True
+    node.cube = MagicMock()
+    node.cube.api.indicator.turn_on = AsyncMock()
+    node.cube.api.indicator.turn_off_all = AsyncMock()
+
+    node.led_callback(ColorRGBA())
+    asyncio.run(node.flush_led())
+
+    node.cube.api.indicator.turn_off_all.assert_awaited_once()
+    node.cube.api.indicator.turn_on.assert_not_awaited()
+
+
+def test_led_keeps_only_the_newest_color(node):
+    node.is_connected = True
+    node.cube = MagicMock()
+    node.cube.api.indicator.turn_on = AsyncMock()
+
+    # a burst from a fast publisher must not queue up one BLE write each
+    node.led_callback(ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0))
+    node.led_callback(ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0))
+    asyncio.run(node.flush_led())
+
+    param = node.cube.api.indicator.turn_on.call_args[0][0]
+    assert param.color.flatten() == (0, 255, 0)
+    assert node.cube.api.indicator.turn_on.await_count == 1
+
+
+def test_led_unchanged_color_is_not_rewritten(node):
+    node.is_connected = True
+    node.cube = MagicMock()
+    node.cube.api.indicator.turn_on = AsyncMock()
+
+    node.led_callback(ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0))
+    asyncio.run(node.flush_led())
+    asyncio.run(node.flush_led())
+
+    # the indicator holds its state, so an idle BLE write is pointless
+    assert node.cube.api.indicator.turn_on.await_count == 1
+
+
+def test_led_is_retried_after_a_failed_write(node):
+    node.is_connected = True
+    node.cube = MagicMock()
+    node.cube.api.indicator.turn_on = AsyncMock(side_effect=RuntimeError('ble'))
+
+    node.led_callback(ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0))
+    asyncio.run(node.flush_led())
+    node.cube.api.indicator.turn_on.side_effect = None
+    asyncio.run(node.flush_led())
+
+    assert node.cube.api.indicator.turn_on.await_count == 2
+    assert node._last_led_cmd == (255, 0, 0)
+
+
+def test_sound_plays_the_requested_effect(node, scheduled):
+    node.is_connected = True
+    node.cube = MagicMock()
+    node.cube.api.sound.play_sound_effect = AsyncMock()
+
+    node.sound_callback(UInt8(data=int(SoundId.Get1)))
+    asyncio.run(scheduled[0])
+
+    node.cube.api.sound.play_sound_effect.assert_awaited_once_with(
+        SoundId.Get1, node.sound_volume)
+
+
+def test_sound_unknown_id_is_ignored(node, scheduled):
+    node.is_connected = True
+
+    # https://toio.github.io/toio-spec/docs/ble_sound#sound-effect-id
+    node.sound_callback(UInt8(data=int(max(SoundId)) + 1))
+
+    assert not scheduled
+
+
+def test_sound_is_throttled(node, scheduled):
+    node.is_connected = True
+
+    # a sound is an event and cannot be coalesced, so the burst is dropped
+    node.sound_callback(UInt8(data=int(SoundId.Get1)))
+    node.sound_callback(UInt8(data=int(SoundId.Get2)))
+    assert len(scheduled) == 1
+
+    # the next command is accepted once the interval has passed
+    node._last_sound_time -= node.sound_min_interval
+    node.sound_callback(UInt8(data=int(SoundId.Get2)))
+    assert len(scheduled) == 2
+
+
+def test_sound_command_failure_does_not_raise(node):
+    node.cube = MagicMock()
+    node.cube.api.sound.play_sound_effect = AsyncMock(side_effect=RuntimeError('ble'))
+
+    # nobody awaits this coroutine, so it must swallow and log instead
+    asyncio.run(node.play_sound(SoundId.Get1))
+
+
+def make_connected_cube_mock():
+    cube = MagicMock()
+    cube.api.motor.motor_control = AsyncMock()
+    cube.api.indicator.turn_off_all = AsyncMock()
+    cube.api.sound.stop = AsyncMock()
+    cube.api.id_information.unregister_notification_handler = AsyncMock()
+    cube.api.battery.unregister_notification_handler = AsyncMock()
+    cube.api.motor.unregister_notification_handler = AsyncMock()
+    cube.disconnect = AsyncMock()
+    return cube
+
+
+def test_shutdown_turns_off_led_and_sound(node):
+    node.is_connected = True
+    node.cube = make_connected_cube_mock()
+
+    asyncio.run(node.shutdown_toio())
+
+    node.cube.api.indicator.turn_off_all.assert_awaited_once()
+    node.cube.api.sound.stop.assert_awaited_once()
+    node.cube.disconnect.assert_awaited_once()
+
+
+def test_shutdown_disconnects_even_if_turning_off_fails(node):
+    node.is_connected = True
+    node.cube = make_connected_cube_mock()
+    node.cube.api.indicator.turn_off_all = AsyncMock(side_effect=RuntimeError('ble'))
+
+    asyncio.run(node.shutdown_toio())
+
+    node.cube.disconnect.assert_awaited_once()
 
 
 def test_position_id_notification_publishes_pose(node):
