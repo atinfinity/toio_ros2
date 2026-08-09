@@ -121,7 +121,9 @@ class ToioNode(Node):
         # Visual / audible feedback (issue #28). led_duration_ms 0 keeps the
         # indicator lit until the next command; 10-2550 lets the cube turn it
         # off on its own (a fraction below 10ms is truncated and anything above
-        # 2550ms is clipped by toio.py). sound_volume is 0 (mute) to 255.
+        # 2550ms is clipped by toio.py). sound_volume is mute or full volume
+        # only, as the cube takes 0 as mute and every other value as the
+        # maximum volume.
         self.declare_parameter('led_duration_ms', 0)
         self.declare_parameter('sound_volume', 255)
 

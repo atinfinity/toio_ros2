@@ -60,7 +60,7 @@ Please see <https://toio.github.io/toio-spec/docs/hardware_position_id> in detai
 |frame_prefix|string|''|prefix of the TF child frame (`<frame_prefix>center`) for multi-cube setups|
 |enable_goal_pose_motion|bool|true|subscribe `goal_pose` and use the cube built-in target motion. Set to false when an external traffic authority (e.g. Open-RMF) owns the motion plan and all movement must go through Nav2 `cmd_vel`|
 |led_duration_ms|int|0|lighting time of `/toio/led`. 0 keeps the indicator lit until the next command, 10-2550 lets the cube turn it off on its own (a fraction below 10ms is truncated, anything above 2550ms is clipped)|
-|sound_volume|int|255|volume of `/toio/sound` (0 is mute, 1-255)|
+|sound_volume|int|255|volume of `/toio/sound`. Per the [toio spec](https://toio.github.io/toio-spec/docs/ble_sound) this is mute or full volume only: 0 is mute and every other value is the maximum volume|
 
 Parameter files is stored in [params](params).
 And, [launch/toio_ros2_bringup.launch.py](launch/toio_ros2_bringup.launch.py) load [params/toio_a4_play_mat_params.yaml](params/toio_a4_play_mat_params.yaml) as default.
