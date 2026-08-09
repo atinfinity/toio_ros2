@@ -577,6 +577,14 @@ class ToioNode(Node):
     async def shutdown_toio(self) -> None:
         if self.is_connected:
             self.is_connected = False  # stop motor_command_loop / watchdog sends
+            # Unregister before the cleanup writes below: a SIGINT shuts the
+            # rclpy context down before destroy_node() runs (see main()), so a
+            # notification arriving while those BLE round-trips are in flight
+            # would publish on an invalid context and raise.
+            # Passing None unregisters all handlers.
+            await self.cube.api.id_information.unregister_notification_handler(None)
+            await self.cube.api.battery.unregister_notification_handler(None)
+            await self.cube.api.motor.unregister_notification_handler(None)
             await self.cube.api.motor.motor_control(0, 0)
             # do not leave the cube lit or buzzing after the node exits, but
             # keep disconnecting when the cube no longer answers
@@ -585,10 +593,6 @@ class ToioNode(Node):
                 await self.cube.api.sound.stop()
             except Exception as e:
                 self.get_logger().warn(f'failed to turn off led/sound: {e}')
-            # passing None unregisters all handlers
-            await self.cube.api.id_information.unregister_notification_handler(None)
-            await self.cube.api.battery.unregister_notification_handler(None)
-            await self.cube.api.motor.unregister_notification_handler(None)
             await self.cube.disconnect()
 
     def destroy_node(self):
