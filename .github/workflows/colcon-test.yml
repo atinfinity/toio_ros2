@@ -8,12 +8,12 @@ jobs:
     container: ros:jazzy-ros-base
     steps:
       - name: Checkout toio_ros2
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           path: src/toio_ros2
 
       - name: Checkout toio_description
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: atinfinity/toio_description
           path: src/toio_description
