@@ -18,9 +18,13 @@ import threading
 import time
 
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
+from nav2_msgs.action import NavigateToPose
 from rcl_interfaces.msg import SetParametersResult
 import rclpy
-from rclpy.executors import ExternalShutdownException
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState
 from std_msgs.msg import ColorRGBA, UInt8
@@ -59,8 +63,17 @@ class ToioNode(Node):
         'motor_dedup_interval': (MIN_SEND_INTERVAL, MOTOR_DURATION_MS / 1000.0),
     }
 
-    def __init__(self) -> None:
-        super().__init__('toio_ros2_node')
+    # How long past the cube's own dock_timeout a dock still waits for the
+    # motor response before giving up. A notification lost to a flaky BLE
+    # link must not leave the caller (Open-RMF) hanging forever.
+    DOCK_RESPONSE_GRACE = 5.0  # seconds
+
+    # How often the dock waits on its completion event, which is also how
+    # quickly a cancel request and a BLE disconnection are noticed
+    DOCK_POLL_INTERVAL = 0.1  # seconds
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__('toio_ros2_node', **kwargs)
         # https://toio.github.io/toio-spec/en/docs/hardware_shape
         self.wheel_base = 0.0266  # meter
         self.wheel_radius = 0.00625  # meter
@@ -101,6 +114,18 @@ class ToioNode(Node):
         # faster than this are dropped instead
         self._last_sound_time: float = 0.0
 
+        # Docking state (issue toio_fleet_adapter#3). Claimed in the action
+        # server's goal callback and released in its execute callback, and
+        # read by cmd_vel_callback / motor_command_loop so nothing writes to
+        # the motor while the cube is running a target motion.
+        self._dock_lock = threading.Lock()
+        self._docking = False
+        self._dock_done = threading.Event()
+        self._dock_response = None
+        self._dock_started_at: float = 0.0
+        # Latest published position, used for the dock action feedback
+        self._last_pose_xy: tuple = None
+
         # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
         self.declare_parameter('field_min_x', 98.0)
         self.declare_parameter('field_max_x', 402.0)
@@ -109,9 +134,14 @@ class ToioNode(Node):
         self.declare_parameter('field_width_meter', 0.297)
         self.declare_parameter('field_height_meter', 0.210)
 
-        # Params for goal_pose motion
+        # Params for goal_pose motion, shared with the dock_to_pose action
         self.declare_parameter('goal_max_speed', 30)
         self.declare_parameter('goal_timeout', 60)
+        # A dock covers a few centimetres at most, so it gets its own much
+        # shorter timeout. With goal_timeout a cube that cannot reach the
+        # target - because something is standing on it - keeps pushing for a
+        # full minute before the motion is abandoned.
+        self.declare_parameter('dock_timeout', 10)
         # Margin (in Position ID units) kept between a clamped goal and the
         # mat boundary so the cube's ID sensor stays in the readable area
         self.declare_parameter('goal_boundary_margin', 10)
@@ -134,6 +164,9 @@ class ToioNode(Node):
         # on a path that no external planner knows about. Disable it when an
         # external traffic authority (e.g. Open-RMF) owns the motion plan and
         # all movement must go through Nav2 cmd_vel instead.
+        #
+        # This does NOT disable the dock_to_pose action, which uses the same
+        # built-in motion; see the comment where that server is created.
         self.declare_parameter('enable_goal_pose_motion', True)
 
         # Visual / audible feedback (issue #28). led_duration_ms 0 keeps the
@@ -177,6 +210,8 @@ class ToioNode(Node):
             'goal_max_speed').get_parameter_value().integer_value
         self.goal_timeout = self.get_parameter(
             'goal_timeout').get_parameter_value().integer_value
+        self.dock_timeout = self.get_parameter(
+            'dock_timeout').get_parameter_value().integer_value
         self.goal_boundary_margin = self.get_parameter(
             'goal_boundary_margin').get_parameter_value().integer_value
         self.cube_id = self.get_parameter('cube_id').get_parameter_value().string_value
@@ -264,6 +299,34 @@ class ToioNode(Node):
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
 
+        # action server
+        #
+        # Precise final positioning requested by an external traffic
+        # authority (Open-RMF docking, toio_fleet_adapter#3).
+        #
+        # Deliberately NOT gated on enable_goal_pose_motion. That parameter
+        # closes the goal_pose topic, where anyone can make the cube drive a
+        # built-in target motion along a path no planner knows about, at a
+        # time no planner chose. This action inverts all three: the traffic
+        # authority issues it itself, at a waypoint it has already reserved,
+        # over a few centimetres, and it waits for the result before doing
+        # anything else. Gating it here would leave the fleet adapter with no
+        # way to improve on the Nav2 goal tolerance.
+        #
+        # ReentrantCallbackGroup, not the default mutually exclusive one: the
+        # cancel request arrives on this same server while the execute
+        # callback is blocked waiting for the cube, so an exclusive group
+        # would queue the cancel behind the goal it is meant to cancel.
+        self._dock_cb_group = ReentrantCallbackGroup()
+        self.dock_action_server = ActionServer(
+            self,
+            NavigateToPose,
+            'dock_to_pose',
+            execute_callback=self.dock_execute_callback,
+            goal_callback=self.dock_goal_callback,
+            cancel_callback=self.dock_cancel_callback,
+            callback_group=self._dock_cb_group)
+
         # timer
         self.monitor_connection_timer = self.create_timer(1.0, self.monitor_connection_callback)
 
@@ -288,6 +351,15 @@ class ToioNode(Node):
 
     def cmd_vel_callback(self, msg: Twist) -> None:
         if not self.is_connected:
+            return
+
+        if self._docking:
+            # Dropped rather than stored: applying a pre-dock command once the
+            # dock finishes would drive the cube straight off the pose it just
+            # reached. Nothing publishes cmd_vel during a dock under Open-RMF
+            # anyway, since the fleet adapter has no Nav2 goal in flight then.
+            self.get_logger().warn(
+                'cmd_vel ignored while docking', throttle_duration_sec=1.0)
             return
 
         v = msg.linear.x
@@ -318,6 +390,13 @@ class ToioNode(Node):
         if not self.is_connected:
             return
 
+        if self._docking:
+            # The cube's motor response carries no usable request id, so a
+            # target motion started here would be indistinguishable from the
+            # dock's own and could complete it early with the wrong result
+            self.get_logger().warn('goal_pose ignored while docking')
+            return
+
         pos_x = msg.pose.position.x
         pos_y = msg.pose.position.y
         q_x = msg.pose.orientation.x
@@ -329,6 +408,126 @@ class ToioNode(Node):
         asyncio.run_coroutine_threadsafe(
             self.motor_control_target(x, y, angle),
             self.loop)
+
+    def dock_goal_callback(self, goal_request) -> GoalResponse:
+        """Accept a dock goal only while the cube is connected and idle."""
+        if not self.is_connected:
+            self.get_logger().warn('dock rejected: toio is not connected')
+            return GoalResponse.REJECT
+        with self._dock_lock:
+            if self._docking:
+                # Only one target motion can be tracked at a time: the cube's
+                # response carries no usable request id (toio.py hardcodes it
+                # to 0), so a second dock could complete the first one
+                self.get_logger().warn('dock rejected: already docking')
+                return GoalResponse.REJECT
+            # Claimed here rather than in execute() so a second goal cannot
+            # be accepted in the window before the first one starts running
+            self._docking = True
+            self._dock_done.clear()
+            self._dock_response = None
+        return GoalResponse.ACCEPT
+
+    def dock_cancel_callback(self, goal_handle) -> CancelResponse:
+        """Allow a dock to be cancelled (Open-RMF stopping mid-dock)."""
+        return CancelResponse.ACCEPT
+
+    def dock_execute_callback(self, goal_handle):
+        """Drive the cube to the goal pose with its built-in target motion."""
+        try:
+            return self._run_dock(goal_handle)
+        finally:
+            with self._dock_lock:
+                self._docking = False
+            # motor_control() skips a command identical to the last one sent
+            # inside motor_dedup_interval. The cmd_vel that resumes after a
+            # dock is very often that same tuple, so without this the first
+            # write back would be dropped and the cube would sit still.
+            self._last_motor_cmd_time = 0.0
+
+    def _run_dock(self, goal_handle):
+        pose = goal_handle.request.pose.pose
+        x, y, angle = self.convert_ros_to_toio_coord(
+            pose.position.x, pose.position.y,
+            pose.orientation.x, pose.orientation.y,
+            pose.orientation.z, pose.orientation.w)
+        self.get_logger().info(
+            f'dock_to_pose received, x = {x}, y = {y}, angle = {angle}')
+        self._dock_started_at = time.monotonic()
+        asyncio.run_coroutine_threadsafe(
+            self.motor_control_target(x, y, angle, timeout=self.dock_timeout),
+            self.loop)
+
+        result = NavigateToPose.Result()
+        deadline = self._dock_started_at + self.dock_timeout + \
+            self.DOCK_RESPONSE_GRACE
+        while not self._dock_done.wait(self.DOCK_POLL_INTERVAL):
+            if goal_handle.is_cancel_requested:
+                self._stop_motor()
+                goal_handle.canceled()
+                result.error_msg = 'canceled'
+                return result
+            if not self.is_connected:
+                goal_handle.abort()
+                result.error_code = \
+                    MotorResponseCode.ERROR_INVALID_CUBE_STATE.value
+                result.error_msg = 'BLE disconnected while docking'
+                return result
+            if time.monotonic() > deadline:
+                self._stop_motor()
+                goal_handle.abort()
+                result.error_code = MotorResponseCode.ERROR_TIMEOUT.value
+                result.error_msg = 'no motor response before the deadline'
+                return result
+            goal_handle.publish_feedback(self._make_dock_feedback(pose))
+
+        code = self._dock_response
+        result.error_msg = code.name
+        if code in (MotorResponseCode.SUCCESS,
+                    MotorResponseCode.SUCCESS_WITH_OVERWRITE):
+            if code is MotorResponseCode.SUCCESS_WITH_OVERWRITE:
+                # Another motor command replaced the target motion, so the
+                # cube may have stopped short. Still reported as success: the
+                # caller already reached this pose with Nav2 before asking for
+                # the dock, so a preempted refinement is not a task failure.
+                # It does mean something wrote to the motor during a dock,
+                # which the guards in cmd_vel_callback / motor_command_loop
+                # are supposed to prevent - worth investigating if it appears.
+                self.get_logger().warn(
+                    'dock finished with SUCCESS_WITH_OVERWRITE: the target '
+                    'motion was preempted by another motor command')
+            # error_code stays at NONE (0), which is also SUCCESS's value
+            goal_handle.succeed()
+        else:
+            self.get_logger().warn(f'dock aborted: {code.name}')
+            result.error_code = code.value
+            goal_handle.abort()
+        return result
+
+    def _stop_motor(self) -> None:
+        """Stop the motors from the executor thread (cancel / timeout)."""
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self.cube.api.motor.motor_control(
+                    0, 0, duration_ms=self.MOTOR_DURATION_MS),
+                self.loop)
+            future.result(timeout=1.0)
+        except Exception as e:
+            self.get_logger().warn(f'failed to stop the motor: {e}')
+
+    def _make_dock_feedback(self, goal_pose):
+        feedback = NavigateToPose.Feedback()
+        feedback.navigation_time = Duration(
+            seconds=time.monotonic() - self._dock_started_at).to_msg()
+        pose_xy = self._last_pose_xy
+        if pose_xy is not None:
+            feedback.current_pose.header.frame_id = 'map'
+            feedback.current_pose.pose.position.x = pose_xy[0]
+            feedback.current_pose.pose.position.y = pose_xy[1]
+            feedback.distance_remaining = float(math.hypot(
+                goal_pose.position.x - pose_xy[0],
+                goal_pose.position.y - pose_xy[1]))
+        return feedback
 
     def led_callback(self, msg: ColorRGBA) -> None:
         if not self.is_connected:
@@ -522,6 +721,9 @@ class ToioNode(Node):
         pos_x, pos_y, q_x, q_y, q_z, q_w = self.convert_toio_to_ros_coord(
             info.center.point.x, info.center.point.y, info.center.angle)
 
+        # kept for the dock action feedback, which runs on another thread
+        self._last_pose_xy = (pos_x, pos_y)
+
         # publish PoseStamped
         toio_pose_stamped_msg = self.make_pose_stamped_msg(pos_x, pos_y, q_x, q_y, q_z, q_w)
         self.toio_pose_pub.publish(toio_pose_stamped_msg)
@@ -615,6 +817,16 @@ class ToioNode(Node):
         if not isinstance(info, ResponseMotorControlTarget):
             return
 
+        # Matched by state rather than by request id: toio.py hardcodes the
+        # request id of a target motion to 0, so every response carries the
+        # same one. It is sound here because a dock is the only target motion
+        # that can be in flight (goal_pose is refused while docking, a second
+        # dock goal is rejected, and the cmd_vel path uses motor_control(),
+        # which sends no response at all).
+        if self._docking:
+            self._dock_response = info.response_code
+            self._dock_done.set()
+
         if info.response_code in (MotorResponseCode.SUCCESS,
                                   MotorResponseCode.SUCCESS_WITH_OVERWRITE):
             self.get_logger().info(f'goal result: {info.response_code.name}')
@@ -691,18 +903,30 @@ class ToioNode(Node):
                     f'toio connection failed: {e}. retrying in {self.reconnect_interval}s...')
                 await asyncio.sleep(self.reconnect_interval)
 
+    def pending_motor_cmd(self):
+        """Return the command motor_command_loop() should send, or None."""
+        if not self.is_connected or self._latest_cmd_vel is None:
+            return None
+        # A dock owns the motor until it finishes. Without this the stop
+        # below would land half a second into every dock and overwrite the
+        # target motion, leaving the cube short of the dock pose (the cube
+        # would report SUCCESS_WITH_OVERWRITE).
+        if self._docking:
+            return None
+        # Send stop when cmd_vel goes silent, keeping the auto-stop
+        # semantics of duration_ms=500
+        if time.monotonic() - self._latest_cmd_vel_stamp > self.cmd_vel_timeout:
+            return (0, 0)
+        return self._latest_cmd_vel
+
     async def motor_command_loop(self) -> None:
         # Resident sender: reads the latest cmd_vel at a fixed rate so BLE
         # writes are bounded to 20Hz no matter how fast cmd_vel is published
         while rclpy.ok():
             await asyncio.sleep(0.05)  # 20Hz
-            if not self.is_connected or self._latest_cmd_vel is None:
+            cmd = self.pending_motor_cmd()
+            if cmd is None:
                 continue
-            cmd = self._latest_cmd_vel
-            # Send stop when cmd_vel goes silent, keeping the auto-stop
-            # semantics of duration_ms=500
-            if time.monotonic() - self._latest_cmd_vel_stamp > self.cmd_vel_timeout:
-                cmd = (0, 0)
             try:
                 await self.motor_control(*cmd)
             except Exception as e:
@@ -727,10 +951,10 @@ class ToioNode(Node):
             self._last_motor_cmd = cmd
             self._last_motor_cmd_time = now
 
-    async def motor_control_target(self, x, y, angle) -> None:
+    async def motor_control_target(self, x, y, angle, timeout=None) -> None:
         self.get_logger().debug(f'motor_control_target(): x = {x}, y={y}, angle = {angle}')
         await self.cube.api.motor.motor_control_target(
-            timeout=self.goal_timeout,
+            timeout=self.goal_timeout if timeout is None else timeout,
             movement_type=MovementType.Linear,
             speed=Speed(
                 max=self.goal_max_speed,
@@ -867,8 +1091,16 @@ def main(args=None):
     rclpy.init(args=args)
     node = ToioNode()
 
+    # MultiThreadedExecutor because the dock action blocks its executor
+    # thread for the whole target motion while the cube drives. A single
+    # threaded executor would stop serving cmd_vel and the connection
+    # monitor for that whole time, and could never deliver the cancel
+    # request that ends the dock early. Only the dock server uses a
+    # reentrant callback group; every other callback keeps the default
+    # mutually exclusive one and so stays serialized as before.
+    executor = MultiThreadedExecutor()
     try:
-        rclpy.spin(node)
+        rclpy.spin(node, executor=executor)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:

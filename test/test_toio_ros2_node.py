@@ -15,15 +15,20 @@
 import asyncio
 import math
 import struct
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from geometry_msgs.msg import PoseStamped, Twist
+from nav2_msgs.action import NavigateToPose
 import pytest
 import rclpy
+from rclpy.action import CancelResponse, GoalResponse
+from rclpy.parameter import Parameter
 from std_msgs.msg import ColorRGBA, UInt8
 from tf_transformations import euler_from_quaternion
-from toio import SoundId
+from toio import MotorResponseCode, SoundId
 from toio.device_interface import CubeInfo
 
 from toio_msgs.msg import Led, LedPattern, Melody
@@ -45,6 +50,22 @@ def node(monkeypatch):
     monkeypatch.setattr(ToioNode, 'motor_command_loop', _noop)
     rclpy.init()
     node = ToioNode()
+    yield node
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+@pytest.fixture
+def node_no_goal_pose(monkeypatch):
+    """Build a node the way Open-RMF starts it, with goal_pose off (ADR-5)."""
+    async def _noop(self):
+        return None
+
+    monkeypatch.setattr(ToioNode, 'connect_toio', _noop)
+    monkeypatch.setattr(ToioNode, 'motor_command_loop', _noop)
+    rclpy.init()
+    node = ToioNode(parameter_overrides=[
+        Parameter('enable_goal_pose_motion', Parameter.Type.BOOL, False)])
     yield node
     node.destroy_node()
     rclpy.shutdown()
@@ -453,6 +474,261 @@ def test_motor_notification_accepts_target_responses(node):
     node._on_motor_notification(success)
     node._on_motor_notification(id_missed)
     node._on_motor_notification(motor_speed)
+
+
+# --------------------------------------------------------------------------
+# dock_to_pose action (toio_fleet_adapter#3)
+# --------------------------------------------------------------------------
+def make_motor_target_payload(response_code):
+    # https://toio.github.io/toio-spec/en/docs/ble_motor#responses-to-motor-control-with-target-specified
+    return bytearray(struct.pack('<BBB', 0x83, 0, response_code))
+
+
+def make_dock_goal_handle(x=0.05, y=-0.10, yaw=0.0):
+    goal = NavigateToPose.Goal()
+    goal.pose.header.frame_id = 'map'
+    goal.pose.pose.position.x = x
+    goal.pose.pose.position.y = y
+    goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
+    goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
+    goal_handle = MagicMock()
+    goal_handle.request = goal
+    goal_handle.is_cancel_requested = False
+    return goal_handle
+
+
+def arm_dock(node):
+    """Put the node in the state the action server's goal callback leaves."""
+    node.is_connected = True
+    node.cube = MagicMock()
+    node.cube.api.motor.motor_control = AsyncMock()
+    assert node.dock_goal_callback(NavigateToPose.Goal()) == GoalResponse.ACCEPT
+
+
+def run_dock(node, goal_handle):
+    """Run the blocking execute callback on its own thread."""
+    outcome = {}
+
+    def target():
+        outcome['result'] = node.dock_execute_callback(goal_handle)
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    return thread, outcome
+
+
+def wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def finish_dock(node, goal_handle, response_code, timeout=5.0):
+    """Run a dock to completion, answering it with `response_code`."""
+    thread, outcome = run_dock(node, goal_handle)
+    assert wait_until(lambda: node._dock_started_at > 0.0)
+    node._on_motor_notification(make_motor_target_payload(response_code))
+    thread.join(timeout=timeout)
+    assert not thread.is_alive()
+    return outcome['result']
+
+
+def test_dock_action_server_exists_without_goal_pose_motion(node_no_goal_pose):
+    # the ADR-5 exception: the topic is closed, the dock action is not
+    assert node_no_goal_pose.goal_pose_sub is None
+    assert node_no_goal_pose.dock_action_server is not None
+
+
+def test_dock_goal_rejected_when_disconnected(node):
+    assert node.dock_goal_callback(NavigateToPose.Goal()) == GoalResponse.REJECT
+
+
+def test_dock_goal_rejected_while_already_docking(node):
+    arm_dock(node)
+    # the cube's response carries no request id, so a second dock could
+    # complete the first one
+    assert node.dock_goal_callback(NavigateToPose.Goal()) == GoalResponse.REJECT
+
+
+def test_dock_cancel_is_always_accepted(node):
+    assert node.dock_cancel_callback(MagicMock()) == CancelResponse.ACCEPT
+
+
+def test_dock_converts_the_goal_to_cube_coordinates(node, scheduled, monkeypatch):
+    target = MagicMock()
+    monkeypatch.setattr(node, 'motor_control_target', target)
+    arm_dock(node)
+    pos_x, pos_y, q_x, q_y, q_z, q_w = node.convert_toio_to_ros_coord(250, 250, 90)
+    goal_handle = make_dock_goal_handle()
+    goal_handle.request.pose.pose.position.x = pos_x
+    goal_handle.request.pose.pose.position.y = pos_y
+    goal_handle.request.pose.pose.orientation.x = q_x
+    goal_handle.request.pose.pose.orientation.y = q_y
+    goal_handle.request.pose.pose.orientation.z = q_z
+    goal_handle.request.pose.pose.orientation.w = q_w
+
+    finish_dock(node, goal_handle, MotorResponseCode.SUCCESS.value)
+
+    x, y, angle = target.call_args[0]
+    assert abs(x - 250) <= 1
+    assert abs(y - 250) <= 1
+    assert abs((angle - 90 + 180) % 360 - 180) <= 1
+
+
+def test_dock_success_completes_the_goal(node, scheduled):
+    arm_dock(node)
+    goal_handle = make_dock_goal_handle()
+
+    result = finish_dock(node, goal_handle, MotorResponseCode.SUCCESS.value)
+
+    goal_handle.succeed.assert_called_once()
+    goal_handle.abort.assert_not_called()
+    assert result.error_code == NavigateToPose.Result.NONE
+    assert result.error_msg == 'SUCCESS'
+    assert node._docking is False
+
+
+def test_dock_overwrite_is_reported_as_success(node, scheduled):
+    # the cube may have stopped short, but Nav2 already put it on the
+    # waypoint, so a preempted refinement is not a task failure
+    arm_dock(node)
+    goal_handle = make_dock_goal_handle()
+
+    result = finish_dock(
+        node, goal_handle, MotorResponseCode.SUCCESS_WITH_OVERWRITE.value)
+
+    goal_handle.succeed.assert_called_once()
+    assert result.error_code == NavigateToPose.Result.NONE
+    assert result.error_msg == 'SUCCESS_WITH_OVERWRITE'
+
+
+def test_dock_aborts_when_the_cube_loses_the_position_id(node, scheduled):
+    arm_dock(node)
+    goal_handle = make_dock_goal_handle()
+
+    result = finish_dock(
+        node, goal_handle, MotorResponseCode.ERROR_ID_MISSED.value)
+
+    goal_handle.abort.assert_called_once()
+    goal_handle.succeed.assert_not_called()
+    assert result.error_code == MotorResponseCode.ERROR_ID_MISSED.value
+    assert result.error_msg == 'ERROR_ID_MISSED'
+
+
+def test_dock_cancel_stops_the_motor(node, scheduled):
+    arm_dock(node)
+    goal_handle = make_dock_goal_handle()
+    goal_handle.is_cancel_requested = True
+
+    thread, outcome = run_dock(node, goal_handle)
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    goal_handle.canceled.assert_called_once()
+    assert outcome['result'].error_msg == 'canceled'
+    # cancelling the action is the only thing that stops a target motion:
+    # it runs inside the cube, not on cmd_vel
+    node.cube.api.motor.motor_control.assert_called_once()
+    assert node._docking is False
+
+
+def test_dock_uses_its_own_short_timeout(node, scheduled, monkeypatch):
+    target = MagicMock()
+    monkeypatch.setattr(node, 'motor_control_target', target)
+    arm_dock(node)
+    node.dock_timeout = 7
+
+    finish_dock(node, make_dock_goal_handle(), MotorResponseCode.SUCCESS.value)
+
+    # not goal_timeout (60s): a cube that cannot reach the target because
+    # something is standing on it would keep pushing for a full minute
+    assert target.call_args.kwargs['timeout'] == 7
+    assert node.goal_timeout != node.dock_timeout
+
+
+def test_dock_aborts_when_the_cube_never_answers(node, scheduled):
+    arm_dock(node)
+    node.dock_timeout = 0
+    node.DOCK_RESPONSE_GRACE = 0.2
+    node.DOCK_POLL_INTERVAL = 0.02
+    goal_handle = make_dock_goal_handle()
+
+    thread, outcome = run_dock(node, goal_handle)
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    goal_handle.abort.assert_called_once()
+    assert outcome['result'].error_code == MotorResponseCode.ERROR_TIMEOUT.value
+
+
+def test_dock_aborts_when_ble_drops(node, scheduled):
+    arm_dock(node)
+    node.DOCK_POLL_INTERVAL = 0.02
+    goal_handle = make_dock_goal_handle()
+
+    thread, outcome = run_dock(node, goal_handle)
+    assert wait_until(lambda: node._dock_started_at > 0.0)
+    node.is_connected = False
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    goal_handle.abort.assert_called_once()
+    assert outcome['result'].error_code == \
+        MotorResponseCode.ERROR_INVALID_CUBE_STATE.value
+
+
+def test_dock_clears_its_state_even_when_it_fails(node, scheduled):
+    arm_dock(node)
+    node._last_motor_cmd_time = time.monotonic()
+
+    finish_dock(node, make_dock_goal_handle(),
+                MotorResponseCode.ERROR_ID_MISSED.value)
+
+    assert node._docking is False
+    # the resumed cmd_vel is often the same command as before the dock, and
+    # motor_control() would otherwise dedup the first write back away
+    assert node._last_motor_cmd_time == 0.0
+
+
+def test_cmd_vel_is_dropped_while_docking(node):
+    node.is_connected = True
+    node._docking = True
+    msg = Twist()
+    msg.linear.x = 0.1
+
+    node.cmd_vel_callback(msg)
+
+    # dropped, not stored: applying it after the dock would drive the cube
+    # straight off the pose it just reached
+    assert node._latest_cmd_vel is None
+
+
+def test_goal_pose_is_ignored_while_docking(node, scheduled):
+    node.is_connected = True
+    node._docking = True
+    node.goal_pose_callback(PoseStamped())
+    assert not scheduled
+
+
+def test_motor_command_loop_is_quiesced_while_docking(node):
+    node.is_connected = True
+    node._latest_cmd_vel = (50, 50)
+    node._latest_cmd_vel_stamp = time.monotonic()
+    assert node.pending_motor_cmd() == (50, 50)
+
+    node._docking = True
+    # otherwise the stop below would overwrite the target motion
+    assert node.pending_motor_cmd() is None
+
+
+def test_motor_command_loop_stops_when_cmd_vel_goes_silent(node):
+    node.is_connected = True
+    node._latest_cmd_vel = (50, 50)
+    node._latest_cmd_vel_stamp = time.monotonic() - node.cmd_vel_timeout - 0.1
+    assert node.pending_motor_cmd() == (0, 0)
 
 
 def make_cube_info(name, address):
