@@ -27,10 +27,12 @@ from std_msgs.msg import ColorRGBA, UInt8
 from tf2_ros import TransformBroadcaster
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 from toio import (Battery, BLEScanner, Color, CubeLocation, IdInformation,
-                  IndicatorParam, Motor, MotorResponseCode, MovementType,
-                  Point, PositionId, ResponseMotorControlTarget,
+                  IndicatorParam, MidiNote, Motor, MotorResponseCode,
+                  MovementType, Point, PositionId, ResponseMotorControlTarget,
                   RotationOption, SoundId, Speed, SpeedChangeType,
                   TargetPosition, ToioCoreCube)
+from toio_msgs.msg import Led, LedPattern, Melody
+from toio_msgs.msg import MidiNote as MidiNoteMsg
 
 # Auto-connect mode reports up to this many nearby cubes as cube_id
 # candidates. BLEScanner.scan(num) never stops early at num cubes (toio.py
@@ -93,6 +95,7 @@ class ToioNode(Node):
         # command would leave the cube lit for good.
         self._pending_led: tuple = None
         self._last_led_cmd: tuple = None
+        self._last_led_pattern_time: float = 0.0
 
         # A sound is an event and cannot be coalesced, so commands arriving
         # faster than this are dropped instead
@@ -234,6 +237,24 @@ class ToioNode(Node):
             'toio/sound',
             self.sound_callback,
             10)
+        # Separate topics rather than replacing the two above: toio_gazebo
+        # subscribes to toio/sound, and a plain color is the common case that
+        # should stay publishable with `ros2 topic pub` and std_msgs alone
+        self.led_timed_sub = self.create_subscription(
+            Led,
+            'toio/led_timed',
+            self.led_timed_callback,
+            10)
+        self.led_pattern_sub = self.create_subscription(
+            LedPattern,
+            'toio/led_pattern',
+            self.led_pattern_callback,
+            10)
+        self.melody_sub = self.create_subscription(
+            Melody,
+            'toio/melody',
+            self.melody_callback,
+            10)
 
         # publisher
         self.toio_pose_pub = self.create_publisher(PoseStamped, 'toio/pose', qos_profile=10)
@@ -317,7 +338,102 @@ class ToioNode(Node):
         # tuple assignment is atomic, read by led_command_loop()
         self._pending_led = (self.to_led_value(msg.r),
                              self.to_led_value(msg.g),
-                             self.to_led_value(msg.b))
+                             self.to_led_value(msg.b),
+                             None)
+
+    def led_timed_callback(self, msg) -> None:
+        """Set the indicator with a duration carried by the message."""
+        if not self.is_connected:
+            return
+
+        self._pending_led = (self.to_led_value(msg.color.r),
+                             self.to_led_value(msg.color.g),
+                             self.to_led_value(msg.color.b),
+                             self.to_duration_ms(msg.duration_ms))
+
+    def led_pattern_callback(self, msg) -> None:
+        """Hand a blink sequence to the cube to play on its own."""
+        if not self.is_connected:
+            return
+
+        steps = self.checked_sequence(
+            msg.steps, LedPattern.STEPS_MAX, 'led pattern')
+        if steps is None:
+            return
+
+        # A pattern is an event and cannot be coalesced the way a single color
+        # can, so it is throttled like a sound instead of latched
+        now = time.monotonic()
+        if now - self._last_led_pattern_time < self.led_write_interval:
+            self.get_logger().debug('led pattern command throttled')
+            return
+        self._last_led_pattern_time = now
+
+        # The cube is now running a pattern, so the latched single color no
+        # longer describes the indicator; drop it or the next flush would
+        # overwrite the pattern with a stale color
+        self._pending_led = None
+        self._last_led_cmd = None
+
+        asyncio.run_coroutine_threadsafe(
+            self.play_led_pattern(
+                msg.repeat,
+                [(self.to_led_value(s.color.r),
+                  self.to_led_value(s.color.g),
+                  self.to_led_value(s.color.b),
+                  self.to_duration_ms(s.duration_ms)) for s in steps]),
+            self.loop)
+
+    def melody_callback(self, msg) -> None:
+        """Hand a melody to the cube to play on its own."""
+        if not self.is_connected:
+            return
+
+        notes = self.checked_sequence(
+            msg.notes, Melody.NOTES_MAX, 'melody')
+        if notes is None:
+            return
+        for note in notes:
+            if note.note > MidiNoteMsg.NOTE_MAX:
+                self.get_logger().warn(
+                    f'melody rejected: note {note.note} is above '
+                    f'{MidiNoteMsg.NOTE_MAX}')
+                return
+
+        # Shares the cube's sound channel with the effect topic, so it shares
+        # the throttle too
+        now = time.monotonic()
+        if now - self._last_sound_time < self.sound_min_interval:
+            self.get_logger().debug('melody command throttled')
+            return
+        self._last_sound_time = now
+
+        asyncio.run_coroutine_threadsafe(
+            self.play_melody(
+                msg.repeat,
+                [(self.to_duration_ms(n.duration_ms), n.note, n.volume)
+                 for n in notes]),
+            self.loop)
+
+    def checked_sequence(self, items, limit, what):
+        """Return items if the cube can take them, otherwise None."""
+        if len(items) == 0:
+            self.get_logger().warn(f'{what} rejected: no entries')
+            return None
+        if len(items) > limit:
+            # Truncating would play a pattern nobody asked for, which is
+            # harder to notice than nothing happening
+            self.get_logger().warn(
+                f'{what} rejected: {len(items)} entries exceeds the '
+                f'{limit} the cube accepts')
+            return None
+        return items
+
+    @staticmethod
+    def to_duration_ms(duration_ms: int) -> int:
+        # The cube counts in 10ms units and stops at 2550ms; toio.py clips
+        # silently, so clip here too and keep the two consistent
+        return min(int(duration_ms), Led.DURATION_MAX_MS)
 
     def sound_callback(self, msg: UInt8) -> None:
         if not self.is_connected:
@@ -649,14 +765,36 @@ class ToioNode(Node):
             return
         self._last_led_cmd = cmd
 
-    async def set_indicator(self, r, g, b) -> None:
+    async def set_indicator(self, r, g, b, duration_ms=None) -> None:
+        # duration_ms None means "use the node-wide default", which is what
+        # the plain ColorRGBA topic has no way to express
+        if duration_ms is None:
+            duration_ms = self.led_duration_ms
         if (r, g, b) == (0, 0, 0):
             await self.cube.api.indicator.turn_off_all()
         else:
             await self.cube.api.indicator.turn_on(
                 IndicatorParam(
-                    duration_ms=self.led_duration_ms,
+                    duration_ms=duration_ms,
                     color=Color(r=r, g=g, b=b)))
+
+    async def play_led_pattern(self, repeat, steps) -> None:
+        try:
+            await self.cube.api.indicator.repeated_turn_on(
+                repeat,
+                [IndicatorParam(duration_ms=d, color=Color(r=r, g=g, b=b))
+                 for r, g, b, d in steps])
+        except Exception as e:
+            self.get_logger().warn(f'led pattern command failed: {e}')
+
+    async def play_melody(self, repeat, notes) -> None:
+        try:
+            await self.cube.api.sound.play_midi(
+                repeat,
+                [MidiNote(duration_ms=d, note=n, volume=v)
+                 for d, n, v in notes])
+        except Exception as e:
+            self.get_logger().warn(f'melody command failed: {e}')
 
     async def play_sound(self, sound_id: SoundId) -> None:
         # Nobody awaits the future returned by run_coroutine_threadsafe, so an

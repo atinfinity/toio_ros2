@@ -30,6 +30,9 @@ I checked this package on the following environment.
 |/goal_pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|desired robot pose (cube built-in target motion; disabled when `enable_goal_pose_motion` is false)|
 |/toio/led|[std_msgs/msg/ColorRGBA](https://docs.ros2.org/foxy/api/std_msgs/msg/ColorRGBA.html)|indicator color. `r`/`g`/`b` are 0.0-1.0 and scaled to the cube range of 0-255 (`a` is unused); all zero turns the indicator off|
 |/toio/sound|[std_msgs/msg/UInt8](https://docs.ros2.org/foxy/api/std_msgs/msg/UInt8.html)|[sound effect ID](https://toio.github.io/toio-spec/docs/ble_sound) (0-10). An out-of-range ID is ignored with a warning|
+|/toio/led_timed|[toio_msgs/msg/Led](https://github.com/atinfinity/toio_msgs)|indicator color with a per-command lighting time, for when `led_duration_ms` is not the same for every command|
+|/toio/led_pattern|[toio_msgs/msg/LedPattern](https://github.com/atinfinity/toio_msgs)|blink sequence the cube plays on its own (up to 29 steps). `repeat` 0 repeats until the next indicator command. Rejected with a warning if it is empty or too long|
+|/toio/melody|[toio_msgs/msg/Melody](https://github.com/atinfinity/toio_msgs)|MIDI melody the cube plays on its own (up to 59 notes, note 0-128 with 128 as a rest). Shares the sound throttle with `/toio/sound`|
 
 ## Published topics
 
@@ -80,6 +83,7 @@ declare_params_file_cmd = DeclareLaunchArgument(
 mkdir -p ~/dev_ws/src
 cd ~/dev_ws/src
 git clone https://github.com/atinfinity/toio_description.git
+git clone https://github.com/atinfinity/toio_msgs.git
 git clone https://github.com/atinfinity/toio_ros2.git
 cd ..
 rosdep install -y -i --from-paths src
@@ -164,6 +168,25 @@ ros2 topic pub --once /toio/led std_msgs/msg/ColorRGBA "{r: 1.0, g: 0.0, b: 0.0,
 
 # play the 'Get1' sound effect
 ros2 topic pub --once /toio/sound std_msgs/msg/UInt8 "{data: 6}"
+```
+
+Blink red for one second and off for one second, five times. The cube runs the
+sequence itself, so it keeps its timing and survives a BLE dropout:
+
+```bash
+ros2 topic pub --once /toio/led_pattern toio_msgs/msg/LedPattern "{steps: [{color: {r: 1.0, g: 0.0, b: 0.0, a: 1.0}, duration_ms: 1000}, {color: {r: 0.0, g: 0.0, b: 0.0, a: 1.0}, duration_ms: 1000}], repeat: 5}"
+```
+
+Play three notes:
+
+```bash
+ros2 topic pub --once /toio/melody toio_msgs/msg/Melody "{notes: [{duration_ms: 400, note: 60, volume: 255}, {duration_ms: 400, note: 62, volume: 255}, {duration_ms: 400, note: 64, volume: 255}], repeat: 1}"
+```
+
+Light blue for three seconds, without sending an off command afterwards:
+
+```bash
+ros2 topic pub --once /toio/led_timed toio_msgs/msg/Led "{color: {r: 0.0, g: 0.0, b: 1.0, a: 1.0}, duration_ms: 3000}"
 
 # turn the indicator off
 ros2 topic pub --once /toio/led std_msgs/msg/ColorRGBA "{r: 0.0, g: 0.0, b: 0.0, a: 0.0}"
