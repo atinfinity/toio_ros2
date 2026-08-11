@@ -45,6 +45,18 @@ class ToioNode(Node):
     # asking for less than this only queues work the radio cannot deliver.
     MIN_SEND_INTERVAL = 0.02  # seconds
 
+    # Every motor command carries this auto-stop duration, so a drive command
+    # has to be resent before it expires or the cube stops mid-motion
+    MOTOR_DURATION_MS = 500
+
+    # Send-rate parameters and their bounds, as (minimum, maximum). Only the
+    # motor resend has an upper bound, from MOTOR_DURATION_MS above.
+    SEND_INTERVAL_BOUNDS = {
+        'led_write_interval': (MIN_SEND_INTERVAL, None),
+        'sound_min_interval': (MIN_SEND_INTERVAL, None),
+        'motor_dedup_interval': (MIN_SEND_INTERVAL, MOTOR_DURATION_MS / 1000.0),
+    }
+
     def __init__(self) -> None:
         super().__init__('toio_ros2_node')
         # https://toio.github.io/toio-spec/en/docs/hardware_shape
@@ -66,7 +78,6 @@ class ToioNode(Node):
         # Command deduplication with time-based resend
         self._last_motor_cmd: tuple = (0, 0)
         self._last_motor_cmd_time: float = 0.0
-        self.motor_dedup_interval = 0.3  # seconds
 
         # Latest-command-only pattern for cmd_vel: the subscriber only stores
         # the newest command and motor_command_loop() sends it, so BLE writes
@@ -141,8 +152,12 @@ class ToioNode(Node):
         # led_write_interval is how often led_command_loop() sends the latest
         # color; sound_min_interval throttles sound commands, and anything
         # arriving inside it is dropped rather than queued.
+        # motor_dedup_interval is how often the same non-stop motor command is
+        # resent. It must stay under MOTOR_DURATION_MS or the cube auto-stops
+        # before the resend arrives and the robot stutters.
         self.declare_parameter('led_write_interval', 0.1)
         self.declare_parameter('sound_min_interval', 0.1)
+        self.declare_parameter('motor_dedup_interval', 0.3)
 
         # Get params for field information
         self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
@@ -180,6 +195,10 @@ class ToioNode(Node):
             'sound_min_interval',
             self.get_parameter(
                 'sound_min_interval').get_parameter_value().double_value)
+        self.motor_dedup_interval = self.clamp_send_interval(
+            'motor_dedup_interval',
+            self.get_parameter(
+                'motor_dedup_interval').get_parameter_value().double_value)
         # led_command_loop() and the sound throttle read these every time, so
         # setting them at runtime takes effect without a restart
         self.add_on_set_parameters_callback(self.on_set_parameters)
@@ -322,40 +341,47 @@ class ToioNode(Node):
             self.play_sound(sound_id),
             self.loop)
 
+    def send_interval_error(self, name: str, value: float):
+        """Return why `value` is not usable for `name`, or None if it is."""
+        minimum, maximum = self.SEND_INTERVAL_BOUNDS[name]
+        # NaN compares false against everything, so a plain range check would
+        # let it through
+        if not math.isfinite(value):
+            return f'{name} must be a finite number'
+        if value < minimum:
+            return f'{name} must be at least {minimum}s'
+        if maximum is not None and value >= maximum:
+            return (f'{name} must be below {maximum}s, the motor command '
+                    f'auto-stop')
+        return None
+
     def clamp_send_interval(self, name: str, value: float) -> float:
         # Startup only: a bad value in a params file clamps with a warning
         # rather than refusing to start. Runtime changes are rejected instead
         # (see on_set_parameters), which keeps the reported value honest.
-        #
-        # led_command_loop() sleeps for this, so a zero or negative interval
-        # would spin the asyncio loop and flood the BLE link. NaN compares
-        # false against everything, which would slip past a plain lower bound.
-        if not math.isfinite(value) or value < self.MIN_SEND_INTERVAL:
-            self.get_logger().warn(
-                f'{name}={value} is below the {self.MIN_SEND_INTERVAL}s '
-                f'minimum; using {self.MIN_SEND_INTERVAL}s')
-            return self.MIN_SEND_INTERVAL
-        return value
+        error = self.send_interval_error(name, value)
+        if error is None:
+            return value
+        minimum, maximum = self.SEND_INTERVAL_BOUNDS[name]
+        # Half the auto-stop leaves room for one missed resend
+        fallback = minimum if (
+            not math.isfinite(value) or value < minimum) else maximum / 2.0
+        self.get_logger().warn(f'{error} (got {value}); using {fallback}s')
+        return fallback
 
     def on_set_parameters(self, params):
         # Rejected rather than clamped: a clamp would leave the parameter
         # reporting the value that was asked for while the node runs at a
         # different one, so `ros2 param get` would lie about the send rate
         for param in params:
-            if param.name not in (
-                    'led_write_interval', 'sound_min_interval'):
+            if param.name not in self.SEND_INTERVAL_BOUNDS:
                 continue
-            if not math.isfinite(param.value) or \
-                    param.value < self.MIN_SEND_INTERVAL:
-                return SetParametersResult(
-                    successful=False,
-                    reason=f'{param.name} must be at least '
-                           f'{self.MIN_SEND_INTERVAL}s')
+            error = self.send_interval_error(param.name, param.value)
+            if error is not None:
+                return SetParametersResult(successful=False, reason=error)
         for param in params:
-            if param.name == 'led_write_interval':
-                self.led_write_interval = param.value
-            elif param.name == 'sound_min_interval':
-                self.sound_min_interval = param.value
+            if param.name in self.SEND_INTERVAL_BOUNDS:
+                setattr(self, param.name, param.value)
         return SetParametersResult(successful=True)
 
     @staticmethod
@@ -580,7 +606,8 @@ class ToioNode(Node):
         if cmd != self._last_motor_cmd or \
                 (cmd != (0, 0) and (now - self._last_motor_cmd_time) >= self.motor_dedup_interval):
             await self.cube.api.motor.motor_control(
-                left_motor_speed, right_motor_speed, duration_ms=500)
+                left_motor_speed, right_motor_speed,
+                duration_ms=self.MOTOR_DURATION_MS)
             self._last_motor_cmd = cmd
             self._last_motor_cmd_time = now
 

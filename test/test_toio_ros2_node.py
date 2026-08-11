@@ -28,6 +28,9 @@ from toio.device_interface import CubeInfo
 
 from toio_ros2.toio_ros2_node import AUTO_CONNECT_SCAN_NUM, ToioNode
 
+SEND_INTERVALS = ['led_write_interval', 'sound_min_interval',
+                  'motor_dedup_interval']
+
 
 @pytest.fixture
 def node(monkeypatch):
@@ -528,16 +531,17 @@ def test_send_intervals_default_to_the_previous_constants(node):
     # change what a deployment that sets nothing gets
     assert node.led_write_interval == pytest.approx(0.1)
     assert node.sound_min_interval == pytest.approx(0.1)
+    assert node.motor_dedup_interval == pytest.approx(0.3)
 
 
-@pytest.mark.parametrize('name', ['led_write_interval', 'sound_min_interval'])
+@pytest.mark.parametrize('name', SEND_INTERVALS)
 def test_send_interval_can_be_set_at_runtime(node, name):
     node.set_parameters([rclpy.parameter.Parameter(
         name, rclpy.Parameter.Type.DOUBLE, 0.25)])
     assert getattr(node, name) == pytest.approx(0.25)
 
 
-@pytest.mark.parametrize('name', ['led_write_interval', 'sound_min_interval'])
+@pytest.mark.parametrize('name', SEND_INTERVALS)
 @pytest.mark.parametrize('bad', [0.0, -1.0, 0.001, float('nan')])
 def test_send_interval_below_the_floor_is_rejected(node, name, bad):
     # led_command_loop() sleeps for this: zero or negative would spin the
@@ -549,12 +553,12 @@ def test_send_interval_below_the_floor_is_rejected(node, name, bad):
         name, rclpy.Parameter.Type.DOUBLE, bad)])
 
     assert result[0].successful is False
-    assert str(ToioNode.MIN_SEND_INTERVAL) in result[0].reason
+    assert name in result[0].reason
     assert getattr(node, name) == pytest.approx(before)
     assert node.get_parameter(name).value == pytest.approx(before)
 
 
-@pytest.mark.parametrize('name', ['led_write_interval', 'sound_min_interval'])
+@pytest.mark.parametrize('name', SEND_INTERVALS)
 @pytest.mark.parametrize('bad', [0.0, -1.0, float('nan')])
 def test_send_interval_from_a_params_file_is_clamped(monkeypatch, name, bad):
     # A bad value at startup must not stop the node from coming up
@@ -591,3 +595,48 @@ def test_sound_throttle_follows_the_parameter(node, scheduled):
     node._last_sound_time -= 0.5
     node.sound_callback(UInt8(data=0))
     assert len(scheduled) == 2
+
+
+@pytest.mark.parametrize('bad', [0.5, 0.75])
+def test_motor_dedup_above_the_auto_stop_is_rejected(node, bad):
+    # Every motor command carries a 500ms auto-stop, so resending at or after
+    # that leaves the cube stopped between commands and the robot stutters
+    before = node.motor_dedup_interval
+    result = node.set_parameters([rclpy.parameter.Parameter(
+        'motor_dedup_interval', rclpy.Parameter.Type.DOUBLE, bad)])
+
+    assert result[0].successful is False
+    assert 'auto-stop' in result[0].reason
+    assert node.motor_dedup_interval == pytest.approx(before)
+
+
+def test_motor_dedup_above_the_auto_stop_from_a_params_file_is_clamped(node):
+    # Startup must not refuse to come up; half the auto-stop leaves room for
+    # one missed resend
+    assert node.clamp_send_interval('motor_dedup_interval', 5.0) == \
+        pytest.approx(ToioNode.MOTOR_DURATION_MS / 2000.0)
+
+
+def test_motor_resend_follows_the_parameter(node):
+    node.cube = MagicMock()
+    node.cube.api.motor.motor_control = AsyncMock()
+    node.set_parameters([rclpy.parameter.Parameter(
+        'motor_dedup_interval', rclpy.Parameter.Type.DOUBLE, 0.1)])
+
+    asyncio.run(node.motor_control(50, 50))
+    assert node.cube.api.motor.motor_control.await_count == 1
+
+    # The old 0.3s constant would still be deduplicating here
+    node._last_motor_cmd_time -= 0.15
+    asyncio.run(node.motor_control(50, 50))
+    assert node.cube.api.motor.motor_control.await_count == 2
+
+
+def test_motor_command_carries_the_auto_stop_duration(node):
+    node.cube = MagicMock()
+    node.cube.api.motor.motor_control = AsyncMock()
+
+    asyncio.run(node.motor_control(50, 50))
+
+    kwargs = node.cube.api.motor.motor_control.call_args[1]
+    assert kwargs['duration_ms'] == ToioNode.MOTOR_DURATION_MS
