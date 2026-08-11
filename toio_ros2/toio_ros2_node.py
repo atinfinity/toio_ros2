@@ -63,7 +63,7 @@ class ToioNode(Node):
         'motor_dedup_interval': (MIN_SEND_INTERVAL, MOTOR_DURATION_MS / 1000.0),
     }
 
-    # How long past the cube's own goal_timeout a dock still waits for the
+    # How long past the cube's own dock_timeout a dock still waits for the
     # motor response before giving up. A notification lost to a flaky BLE
     # link must not leave the caller (Open-RMF) hanging forever.
     DOCK_RESPONSE_GRACE = 5.0  # seconds
@@ -137,6 +137,11 @@ class ToioNode(Node):
         # Params for goal_pose motion, shared with the dock_to_pose action
         self.declare_parameter('goal_max_speed', 30)
         self.declare_parameter('goal_timeout', 60)
+        # A dock covers a few centimetres at most, so it gets its own much
+        # shorter timeout. With goal_timeout a cube that cannot reach the
+        # target - because something is standing on it - keeps pushing for a
+        # full minute before the motion is abandoned.
+        self.declare_parameter('dock_timeout', 10)
         # Margin (in Position ID units) kept between a clamped goal and the
         # mat boundary so the cube's ID sensor stays in the readable area
         self.declare_parameter('goal_boundary_margin', 10)
@@ -205,6 +210,8 @@ class ToioNode(Node):
             'goal_max_speed').get_parameter_value().integer_value
         self.goal_timeout = self.get_parameter(
             'goal_timeout').get_parameter_value().integer_value
+        self.dock_timeout = self.get_parameter(
+            'dock_timeout').get_parameter_value().integer_value
         self.goal_boundary_margin = self.get_parameter(
             'goal_boundary_margin').get_parameter_value().integer_value
         self.cube_id = self.get_parameter('cube_id').get_parameter_value().string_value
@@ -448,11 +455,11 @@ class ToioNode(Node):
             f'dock_to_pose received, x = {x}, y = {y}, angle = {angle}')
         self._dock_started_at = time.monotonic()
         asyncio.run_coroutine_threadsafe(
-            self.motor_control_target(x, y, angle),
+            self.motor_control_target(x, y, angle, timeout=self.dock_timeout),
             self.loop)
 
         result = NavigateToPose.Result()
-        deadline = self._dock_started_at + self.goal_timeout + \
+        deadline = self._dock_started_at + self.dock_timeout + \
             self.DOCK_RESPONSE_GRACE
         while not self._dock_done.wait(self.DOCK_POLL_INTERVAL):
             if goal_handle.is_cancel_requested:
@@ -944,10 +951,10 @@ class ToioNode(Node):
             self._last_motor_cmd = cmd
             self._last_motor_cmd_time = now
 
-    async def motor_control_target(self, x, y, angle) -> None:
+    async def motor_control_target(self, x, y, angle, timeout=None) -> None:
         self.get_logger().debug(f'motor_control_target(): x = {x}, y={y}, angle = {angle}')
         await self.cube.api.motor.motor_control_target(
-            timeout=self.goal_timeout,
+            timeout=self.goal_timeout if timeout is None else timeout,
             movement_type=MovementType.Linear,
             speed=Speed(
                 max=self.goal_max_speed,

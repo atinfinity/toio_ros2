@@ -86,7 +86,8 @@ Please see <https://toio.github.io/toio-spec/docs/hardware_position_id> in detai
 |field_width_meter|double|0.297|width of field(meter)|
 |field_height_meter|double|0.210|height of field(meter)|
 |goal_max_speed|int|30|maximum motor speed for the built-in target motion (`goal_pose` and `dock_to_pose`)|
-|goal_timeout|int|60|timeout(second) for the built-in target motion (`goal_pose` and `dock_to_pose`)|
+|goal_timeout|int|60|timeout(second) for a `goal_pose` motion|
+|dock_timeout|int|10|timeout(second) for a `dock_to_pose` motion. Much shorter than `goal_timeout` because a dock covers a few centimetres: a cube that cannot reach the target, because something is standing on it, must give up quickly instead of pushing for a minute|
 |goal_boundary_margin|int|10|margin(Position ID units) kept between a clamped goal and the mat boundary|
 |cube_id|string|''|connect only to the cube whose BLE local name contains `cube_id`|
 |cube_address|string|''|connect only to the cube with this BLE address|

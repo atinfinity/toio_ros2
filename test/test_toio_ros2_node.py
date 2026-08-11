@@ -635,9 +635,23 @@ def test_dock_cancel_stops_the_motor(node, scheduled):
     assert node._docking is False
 
 
+def test_dock_uses_its_own_short_timeout(node, scheduled, monkeypatch):
+    target = MagicMock()
+    monkeypatch.setattr(node, 'motor_control_target', target)
+    arm_dock(node)
+    node.dock_timeout = 7
+
+    finish_dock(node, make_dock_goal_handle(), MotorResponseCode.SUCCESS.value)
+
+    # not goal_timeout (60s): a cube that cannot reach the target because
+    # something is standing on it would keep pushing for a full minute
+    assert target.call_args.kwargs['timeout'] == 7
+    assert node.goal_timeout != node.dock_timeout
+
+
 def test_dock_aborts_when_the_cube_never_answers(node, scheduled):
     arm_dock(node)
-    node.goal_timeout = 0
+    node.dock_timeout = 0
     node.DOCK_RESPONSE_GRACE = 0.2
     node.DOCK_POLL_INTERVAL = 0.02
     goal_handle = make_dock_goal_handle()
