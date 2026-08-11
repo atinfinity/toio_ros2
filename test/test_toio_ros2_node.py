@@ -521,3 +521,73 @@ def test_schedule_reconnect_runs_only_once(node, scheduled):
 
     assert node.is_connected is False
     assert len(scheduled) == 1
+
+
+def test_send_intervals_default_to_the_previous_constants(node):
+    # These were node constants before issue #32; parameterizing them must not
+    # change what a deployment that sets nothing gets
+    assert node.led_write_interval == pytest.approx(0.1)
+    assert node.sound_min_interval == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize('name', ['led_write_interval', 'sound_min_interval'])
+def test_send_interval_can_be_set_at_runtime(node, name):
+    node.set_parameters([rclpy.parameter.Parameter(
+        name, rclpy.Parameter.Type.DOUBLE, 0.25)])
+    assert getattr(node, name) == pytest.approx(0.25)
+
+
+@pytest.mark.parametrize('name', ['led_write_interval', 'sound_min_interval'])
+@pytest.mark.parametrize('bad', [0.0, -1.0, 0.001, float('nan')])
+def test_send_interval_below_the_floor_is_rejected(node, name, bad):
+    # led_command_loop() sleeps for this: zero or negative would spin the
+    # asyncio loop, and NaN compares false against a plain lower bound.
+    # Rejecting rather than clamping keeps `ros2 param get` honest - clamping
+    # left the parameter reporting 0.0 while the node ran at 0.02.
+    before = getattr(node, name)
+    result = node.set_parameters([rclpy.parameter.Parameter(
+        name, rclpy.Parameter.Type.DOUBLE, bad)])
+
+    assert result[0].successful is False
+    assert str(ToioNode.MIN_SEND_INTERVAL) in result[0].reason
+    assert getattr(node, name) == pytest.approx(before)
+    assert node.get_parameter(name).value == pytest.approx(before)
+
+
+@pytest.mark.parametrize('name', ['led_write_interval', 'sound_min_interval'])
+@pytest.mark.parametrize('bad', [0.0, -1.0, float('nan')])
+def test_send_interval_from_a_params_file_is_clamped(monkeypatch, name, bad):
+    # A bad value at startup must not stop the node from coming up
+    async def _noop(self):
+        return None
+
+    monkeypatch.setattr(ToioNode, 'connect_toio', _noop)
+    monkeypatch.setattr(ToioNode, 'motor_command_loop', _noop)
+    rclpy.init()
+    try:
+        node = ToioNode()
+        node.set_parameters_atomically([rclpy.parameter.Parameter(
+            name, rclpy.Parameter.Type.DOUBLE, ToioNode.MIN_SEND_INTERVAL)])
+        assert node.clamp_send_interval(name, bad) == pytest.approx(
+            ToioNode.MIN_SEND_INTERVAL)
+        node.destroy_node()
+    finally:
+        rclpy.shutdown()
+
+
+def test_sound_throttle_follows_the_parameter(node, scheduled):
+    node.is_connected = True
+    node.set_parameters([rclpy.parameter.Parameter(
+        'sound_min_interval', rclpy.Parameter.Type.DOUBLE, 0.5)])
+
+    node.sound_callback(UInt8(data=0))
+    assert len(scheduled) == 1
+
+    # Inside the new interval: dropped, where the old 0.1s would have passed
+    node._last_sound_time -= 0.2
+    node.sound_callback(UInt8(data=0))
+    assert len(scheduled) == 1
+
+    node._last_sound_time -= 0.5
+    node.sound_callback(UInt8(data=0))
+    assert len(scheduled) == 2

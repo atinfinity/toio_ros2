@@ -18,6 +18,7 @@ import threading
 import time
 
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
+from rcl_interfaces.msg import SetParametersResult
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -39,6 +40,11 @@ AUTO_CONNECT_SCAN_NUM = 10
 
 
 class ToioNode(Node):
+    # Floor for the BLE send intervals. A single write plus its response takes
+    # roughly 60ms on this link (issue #31 measured /toio/pose at 20-57Hz), so
+    # asking for less than this only queues work the radio cannot deliver.
+    MIN_SEND_INTERVAL = 0.02  # seconds
+
     def __init__(self) -> None:
         super().__init__('toio_ros2_node')
         # https://toio.github.io/toio-spec/en/docs/hardware_shape
@@ -76,11 +82,9 @@ class ToioNode(Node):
         # command would leave the cube lit for good.
         self._pending_led: tuple = None
         self._last_led_cmd: tuple = None
-        self.led_write_interval = 0.1  # seconds
 
         # A sound is an event and cannot be coalesced, so commands arriving
         # faster than this are dropped instead
-        self.sound_min_interval = 0.1  # seconds
         self._last_sound_time: float = 0.0
 
         # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
@@ -127,6 +131,19 @@ class ToioNode(Node):
         self.declare_parameter('led_duration_ms', 0)
         self.declare_parameter('sound_volume', 255)
 
+        # BLE send rate limits. Both default to the values these were fixed at
+        # while they were node constants, which one cube on an A4 mat had no
+        # trouble with (issue #31). They are parameters so a deployment that
+        # does run into trouble - more cubes sharing the radio, LED driven as
+        # a status display, sounds played back to back - can trade update rate
+        # against BLE bandwidth without editing the node.
+        #
+        # led_write_interval is how often led_command_loop() sends the latest
+        # color; sound_min_interval throttles sound commands, and anything
+        # arriving inside it is dropped rather than queued.
+        self.declare_parameter('led_write_interval', 0.1)
+        self.declare_parameter('sound_min_interval', 0.1)
+
         # Get params for field information
         self.field_min_x = self.get_parameter('field_min_x').get_parameter_value().double_value
         self.field_max_x = self.get_parameter('field_max_x').get_parameter_value().double_value
@@ -155,6 +172,17 @@ class ToioNode(Node):
             'led_duration_ms').get_parameter_value().integer_value
         self.sound_volume = self.get_parameter(
             'sound_volume').get_parameter_value().integer_value
+        self.led_write_interval = self.clamp_send_interval(
+            'led_write_interval',
+            self.get_parameter(
+                'led_write_interval').get_parameter_value().double_value)
+        self.sound_min_interval = self.clamp_send_interval(
+            'sound_min_interval',
+            self.get_parameter(
+                'sound_min_interval').get_parameter_value().double_value)
+        # led_command_loop() and the sound throttle read these every time, so
+        # setting them at runtime takes effect without a restart
+        self.add_on_set_parameters_callback(self.on_set_parameters)
 
         # calculate scale
         self.scale_x = self.field_width_meter / (self.field_max_x - self.field_min_x)
@@ -293,6 +321,42 @@ class ToioNode(Node):
         asyncio.run_coroutine_threadsafe(
             self.play_sound(sound_id),
             self.loop)
+
+    def clamp_send_interval(self, name: str, value: float) -> float:
+        # Startup only: a bad value in a params file clamps with a warning
+        # rather than refusing to start. Runtime changes are rejected instead
+        # (see on_set_parameters), which keeps the reported value honest.
+        #
+        # led_command_loop() sleeps for this, so a zero or negative interval
+        # would spin the asyncio loop and flood the BLE link. NaN compares
+        # false against everything, which would slip past a plain lower bound.
+        if not math.isfinite(value) or value < self.MIN_SEND_INTERVAL:
+            self.get_logger().warn(
+                f'{name}={value} is below the {self.MIN_SEND_INTERVAL}s '
+                f'minimum; using {self.MIN_SEND_INTERVAL}s')
+            return self.MIN_SEND_INTERVAL
+        return value
+
+    def on_set_parameters(self, params):
+        # Rejected rather than clamped: a clamp would leave the parameter
+        # reporting the value that was asked for while the node runs at a
+        # different one, so `ros2 param get` would lie about the send rate
+        for param in params:
+            if param.name not in (
+                    'led_write_interval', 'sound_min_interval'):
+                continue
+            if not math.isfinite(param.value) or \
+                    param.value < self.MIN_SEND_INTERVAL:
+                return SetParametersResult(
+                    successful=False,
+                    reason=f'{param.name} must be at least '
+                           f'{self.MIN_SEND_INTERVAL}s')
+        for param in params:
+            if param.name == 'led_write_interval':
+                self.led_write_interval = param.value
+            elif param.name == 'sound_min_interval':
+                self.sound_min_interval = param.value
+        return SetParametersResult(successful=True)
 
     @staticmethod
     def to_led_value(value: float) -> int:
