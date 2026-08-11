@@ -42,6 +42,36 @@ I checked this package on the following environment.
 |/toio/battery_state|[sensor_msgs/msg/BatteryState](https://docs.ros2.org/foxy/api/sensor_msgs/msg/BatteryState.html)|battery level of toio (`percentage` is 0.0-1.0). The cube notifies it in 10% steps, see the [toio spec](https://toio.github.io/toio-spec/docs/ble_battery)|
 |/tf|-|a valid transform from `map` to `center`|
 
+## Action servers
+
+|action name|Type|Description|
+|:---|:---|:---|
+|/dock_to_pose|[nav2_msgs/action/NavigateToPose](https://github.com/ros-navigation/navigation2/blob/main/nav2_msgs/action/NavigateToPose.action)|precise final positioning with the cube built-in target motion. Unlike `/goal_pose` it reports the result, can be cancelled, and stays available when `enable_goal_pose_motion` is false (see below)|
+
+`behavior_tree` in the goal is ignored; the cube runs its own motion. On success
+`error_code` is `NONE` and `error_msg` carries the cube's response code name; on
+failure `error_code` is the raw [motor response code](https://toio.github.io/toio-spec/en/docs/ble_motor#responses-to-motor-control-with-target-specified)
+(1 timeout, 2 Position ID missed, 3 invalid parameter, 4 invalid cube state).
+`SUCCESS_WITH_OVERWRITE` is reported as success with a warning: another motor
+command preempted the target motion, so the cube may have stopped short.
+
+Only one dock can be in flight. A second goal is rejected, and `goal_pose` is
+ignored while docking, because the cube's motor response carries no usable
+request id and could otherwise complete the wrong motion. `cmd_vel` is also
+dropped for the duration rather than buffered, so a command from before the
+dock cannot drive the cube off the pose it just reached.
+
+### `goal_pose` vs `dock_to_pose`
+
+`enable_goal_pose_motion: false` exists so that an external traffic authority
+(Open-RMF) owns every motion plan: the `goal_pose` topic lets anyone make the
+cube drive a built-in target motion along a path the planner does not know
+about, at a time the planner did not choose. `dock_to_pose` is exempt because
+it inverts all three properties - the traffic authority issues it itself, at a
+waypoint it has already reserved, over a few centimetres, and it waits for the
+result before doing anything else. It therefore stays available regardless of
+`enable_goal_pose_motion`.
+
 ## Parameters
 
 Default is a param for A4 mat. 
@@ -55,13 +85,13 @@ Please see <https://toio.github.io/toio-spec/docs/hardware_position_id> in detai
 |field_max_y|double|358.0|maximum of `y` in field|
 |field_width_meter|double|0.297|width of field(meter)|
 |field_height_meter|double|0.210|height of field(meter)|
-|goal_max_speed|int|30|maximum motor speed for `goal_pose` motion|
-|goal_timeout|int|60|timeout(second) for `goal_pose` motion|
+|goal_max_speed|int|30|maximum motor speed for the built-in target motion (`goal_pose` and `dock_to_pose`)|
+|goal_timeout|int|60|timeout(second) for the built-in target motion (`goal_pose` and `dock_to_pose`)|
 |goal_boundary_margin|int|10|margin(Position ID units) kept between a clamped goal and the mat boundary|
 |cube_id|string|''|connect only to the cube whose BLE local name contains `cube_id`|
 |cube_address|string|''|connect only to the cube with this BLE address|
 |frame_prefix|string|''|prefix of the TF child frame (`<frame_prefix>center`) for multi-cube setups|
-|enable_goal_pose_motion|bool|true|subscribe `goal_pose` and use the cube built-in target motion. Set to false when an external traffic authority (e.g. Open-RMF) owns the motion plan and all movement must go through Nav2 `cmd_vel`|
+|enable_goal_pose_motion|bool|true|subscribe `goal_pose` and use the cube built-in target motion. Set to false when an external traffic authority (e.g. Open-RMF) owns the motion plan and all movement must go through Nav2 `cmd_vel`. Does not affect the `dock_to_pose` action|
 |led_duration_ms|int|0|lighting time of `/toio/led`. 0 keeps the indicator lit until the next command, 10-2550 lets the cube turn it off on its own (a fraction below 10ms is truncated, anything above 2550ms is clipped)|
 |sound_volume|int|255|volume of `/toio/sound`. Per the [toio spec](https://toio.github.io/toio-spec/docs/ble_sound) this is mute or full volume only: 0 is mute and every other value is the maximum volume|
 
