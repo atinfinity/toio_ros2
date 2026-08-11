@@ -26,6 +26,9 @@ from tf_transformations import euler_from_quaternion
 from toio import SoundId
 from toio.device_interface import CubeInfo
 
+from toio_msgs.msg import Led, LedPattern, Melody
+from toio_msgs.msg import MidiNote as MidiNoteMsg
+
 from toio_ros2.toio_ros2_node import AUTO_CONNECT_SCAN_NUM, ToioNode
 
 SEND_INTERVALS = ['led_write_interval', 'sound_min_interval',
@@ -204,7 +207,8 @@ def test_led_clips_out_of_range_color(node):
     # NaN would raise on int() inside the callback if it were not filtered
     node.led_callback(ColorRGBA(r=1.5, g=-0.2, b=float('nan'), a=1.0))
 
-    assert node._pending_led == (255, 0, 0)
+    # the fourth element is the per-command duration, unset on this topic
+    assert node._pending_led == (255, 0, 0, None)
 
 
 def test_led_all_zero_turns_the_indicator_off(node):
@@ -259,7 +263,7 @@ def test_led_is_retried_after_a_failed_write(node):
     asyncio.run(node.flush_led())
 
     assert node.cube.api.indicator.turn_on.await_count == 2
-    assert node._last_led_cmd == (255, 0, 0)
+    assert node._last_led_cmd == (255, 0, 0, None)
 
 
 def test_sound_plays_the_requested_effect(node, scheduled):
@@ -640,3 +644,145 @@ def test_motor_command_carries_the_auto_stop_duration(node):
 
     kwargs = node.cube.api.motor.motor_control.call_args[1]
     assert kwargs['duration_ms'] == ToioNode.MOTOR_DURATION_MS
+
+
+def led_msg(r, g, b, duration_ms):
+    msg = Led()
+    msg.color = ColorRGBA(r=r, g=g, b=b, a=1.0)
+    msg.duration_ms = duration_ms
+    return msg
+
+
+def test_led_timed_carries_its_own_duration(node):
+    node.is_connected = True
+
+    node.led_timed_callback(led_msg(1.0, 0.0, 0.0, 300))
+
+    assert node._pending_led == (255, 0, 0, 300)
+
+
+def test_led_timed_duration_is_clipped_to_the_cube_limit(node):
+    node.is_connected = True
+
+    node.led_timed_callback(led_msg(1.0, 0.0, 0.0, 60000))
+
+    assert node._pending_led[3] == Led.DURATION_MAX_MS
+
+
+def test_led_timed_duration_reaches_the_cube(node):
+    node.is_connected = True
+    node.cube = MagicMock()
+    node.cube.api.indicator.turn_on = AsyncMock()
+
+    node.led_timed_callback(led_msg(1.0, 0.0, 0.0, 300))
+    asyncio.run(node.flush_led())
+
+    param = node.cube.api.indicator.turn_on.call_args[0][0]
+    assert param.duration_ms == 300
+    # the node-wide default must not win over the message
+    assert param.duration_ms != node.led_duration_ms
+
+
+def test_led_pattern_is_sent_to_the_cube(node, scheduled):
+    node.is_connected = True
+    msg = LedPattern()
+    msg.steps = [led_msg(1.0, 0.0, 0.0, 500), led_msg(0.0, 0.0, 0.0, 500)]
+    msg.repeat = 3
+
+    node.led_pattern_callback(msg)
+
+    assert len(scheduled) == 1
+
+
+def test_led_pattern_drops_the_latched_single_color(node, scheduled):
+    node.is_connected = True
+    node.led_callback(ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0))
+    assert node._pending_led is not None
+
+    msg = LedPattern()
+    msg.steps = [led_msg(0.0, 0.0, 1.0, 500)]
+    node.led_pattern_callback(msg)
+
+    # otherwise the next flush would overwrite the running pattern
+    assert node._pending_led is None
+    assert node._last_led_cmd is None
+
+
+def test_led_pattern_rejects_an_oversized_sequence(node, scheduled):
+    node.is_connected = True
+    msg = LedPattern()
+    msg.steps = [led_msg(1.0, 0.0, 0.0, 100)] * (LedPattern.STEPS_MAX + 1)
+
+    node.led_pattern_callback(msg)
+
+    # truncating would play a pattern nobody asked for
+    assert not scheduled
+
+
+def test_led_pattern_rejects_an_empty_sequence(node, scheduled):
+    node.is_connected = True
+
+    node.led_pattern_callback(LedPattern())
+
+    assert not scheduled
+
+
+def test_melody_is_sent_to_the_cube(node, scheduled):
+    node.is_connected = True
+    msg = Melody()
+    msg.notes = [MidiNoteMsg(duration_ms=200, note=60, volume=255)]
+
+    node.melody_callback(msg)
+
+    assert len(scheduled) == 1
+
+
+def test_melody_rejects_a_note_above_the_cube_range(node, scheduled):
+    node.is_connected = True
+    msg = Melody()
+    msg.notes = [MidiNoteMsg(duration_ms=200, note=200, volume=255)]
+
+    node.melody_callback(msg)
+
+    assert not scheduled
+
+
+def test_melody_rejects_an_oversized_sequence(node, scheduled):
+    node.is_connected = True
+    msg = Melody()
+    msg.notes = [MidiNoteMsg(duration_ms=100, note=60, volume=255)] * (
+        Melody.NOTES_MAX + 1)
+
+    node.melody_callback(msg)
+
+    assert not scheduled
+
+
+def test_melody_shares_the_sound_throttle(node, scheduled):
+    node.is_connected = True
+    msg = Melody()
+    msg.notes = [MidiNoteMsg(duration_ms=100, note=60, volume=255)]
+
+    node.melody_callback(msg)
+    assert len(scheduled) == 1
+
+    # a sound effect right after must be dropped: both use the cube's one
+    # sound channel
+    node.sound_callback(UInt8(data=int(SoundId.Get1)))
+    assert len(scheduled) == 1
+
+    node._last_sound_time -= node.sound_min_interval
+    node.sound_callback(UInt8(data=int(SoundId.Get1)))
+    assert len(scheduled) == 2
+
+
+def test_led_pattern_and_melody_ignored_when_disconnected(node, scheduled):
+    pattern = LedPattern()
+    pattern.steps = [led_msg(1.0, 0.0, 0.0, 100)]
+    melody = Melody()
+    melody.notes = [MidiNoteMsg(duration_ms=100, note=60, volume=255)]
+
+    node.led_pattern_callback(pattern)
+    node.melody_callback(melody)
+
+    assert not scheduled

@@ -18,6 +18,14 @@ jobs:
           repository: atinfinity/toio_description
           path: src/toio_description
 
+      # toio_msgs is a source-only dependency (not released to rosdep), and
+      # the node imports its messages, so the build needs it here
+      - name: Checkout toio_msgs
+        uses: actions/checkout@v7
+        with:
+          repository: atinfinity/toio_msgs
+          path: src/toio_msgs
+
       - name: Install dependencies
         shell: bash
         run: |
