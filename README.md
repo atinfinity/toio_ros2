@@ -1,3 +1,5 @@
+
+
 # toio_ros2
 
 ## Introduction
@@ -118,6 +120,7 @@ git clone https://github.com/atinfinity/toio_msgs.git
 git clone https://github.com/atinfinity/toio_ros2.git
 cd ..
 rosdep install -y -i --from-paths src
+pip install toio-py
 colcon build --symlink-install
 source ~/dev_ws/install/setup.bash
 ```
