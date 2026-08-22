@@ -65,4 +65,17 @@ ros2 topic pub --once /toio/led std_msgs/msg/ColorRGBA "{r: 1.0, g: 0.0, b: 0.0,
 
 ## Frame
 
-![](image/frames.png)
+![](image/frames.svg)
+
+`toio_ros2_node` publishes `map` → `odom` and `odom` → `center` (20Hz), and
+[toio_description](https://github.com/atinfinity/toio_description) the rest of
+the cube. `odom` → `center` is the wheel odometry; `map` → `odom` is corrected
+from the Position ID every time the cube reads the mat and held while the
+Position ID is missed, so the pose keeps moving from the wheel odometry over a
+gap in the mat reading. With `publish_odom: false` the node publishes
+`map` → `center` directly instead and there is no `odom` frame. See
+[Odometry](docs/interfaces.md#odometry).
+
+With `frame_prefix` (multi-cube setups) every frame below `map` gets the prefix
+(`toio1/odom`, `toio1/center`, ...). The figure is drawn from
+[image/frames.gv](image/frames.gv).
