@@ -19,6 +19,7 @@ import time
 
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import Odometry
 from rcl_interfaces.msg import SetParametersResult
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -34,10 +35,11 @@ from tf_transformations import euler_from_quaternion, quaternion_from_euler
 from toio import (Battery, BLEScanner, Color, CubeLocation, IdInformation,
                   IndicatorParam, MidiNote, Motor, MotorResponseCode,
                   MovementType, Point, PositionId, PositionIdMissed,
-                  ResponseMotorControlTarget,
+                  ResponseMotorControlTarget, ResponseMotorSpeed,
                   RotationOption, SoundId, Speed, SpeedChangeType,
                   TargetPosition, ToioCoreCube)
-from toio.cube.api.configuration import SetCollisionDetectionThreshold
+from toio.cube.api.configuration import (MotorSpeedInformationAcquisitionState,
+                                         SetCollisionDetectionThreshold)
 from toio.cube.api.sensor import MotionDetectionData, Sensor
 from toio_msgs.msg import Led, LedPattern, Melody, MotionDetection
 from toio_msgs.msg import MidiNote as MidiNoteMsg
@@ -75,6 +77,11 @@ class ToioNode(Node):
     # How often the dock waits on its completion event, which is also how
     # quickly a cancel request and a BLE disconnection are noticed
     DOCK_POLL_INTERVAL = 0.1  # seconds
+
+    # Odometry integration / publish period (issue #43). The cube reports its
+    # wheel speeds every 100ms and only when they change, so the integration
+    # runs on its own clock and holds the last reported speeds in between.
+    ODOM_PERIOD = 0.05  # seconds
 
     def __init__(self, **kwargs) -> None:
         super().__init__('toio_ros2_node', **kwargs)
@@ -138,6 +145,23 @@ class ToioNode(Node):
         # Reset on every (re)connection because nothing is known about the
         # cube while it is away.
         self._position_id_missed = False
+
+        # Wheel odometry (issue #43). The cube reports the wheel speeds as
+        # unsigned magnitudes in the motor command unit, so the direction is
+        # taken from the last motor command sent (see wheel_velocities()).
+        # _odom_pose is the integrated (x, y, yaw) in the odom frame, and
+        # _map_to_odom the (x, y, yaw) correction recomputed on every Position
+        # ID and held while it is missed, which is what lets the odometry
+        # bridge the gap.
+        self._wheel_speed: tuple = (0, 0)
+        # Direction (+1 / -1) per wheel from the last non-zero motor command.
+        # A stop command carries no direction, and the wheels still report
+        # speed while they coast to a halt after one, so the sign must
+        # outlive the stop.
+        self._wheel_dir: tuple = (1, 1)
+        self._odom_pose: tuple = (0.0, 0.0, 0.0)
+        self._map_to_odom: tuple = (0.0, 0.0, 0.0)
+        self._last_odom_time = None
 
         # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
         self.declare_parameter('field_min_x', 98.0)
@@ -203,6 +227,13 @@ class ToioNode(Node):
         # it far less, so lower it when that is what the topic is for.
         self.declare_parameter('horizontal_threshold', 45)
 
+        # Wheel odometry (issue #43). When true the TF tree becomes
+        # map -> odom -> center and /odom carries the wheel odometry, so Nav2
+        # gets a velocity feedback and the pose keeps moving (dead reckoned)
+        # while the Position ID is missed. When false the node publishes
+        # map -> center straight from the Position ID as it always did.
+        self.declare_parameter('publish_odom', True)
+
         # Visual / audible feedback (issue #28). led_duration_ms 0 keeps the
         # indicator lit until the next command; 10-2550 lets the cube turn it
         # off on its own (a fraction below 10ms is truncated and anything above
@@ -261,6 +292,8 @@ class ToioNode(Node):
             'collision_threshold').get_parameter_value().integer_value
         self.horizontal_threshold = self.get_parameter(
             'horizontal_threshold').get_parameter_value().integer_value
+        self.publish_odom = self.get_parameter(
+            'publish_odom').get_parameter_value().bool_value
         self.led_duration_ms = self.get_parameter(
             'led_duration_ms').get_parameter_value().integer_value
         self.sound_volume = self.get_parameter(
@@ -346,6 +379,9 @@ class ToioNode(Node):
         # that happened long ago
         self.motion_pub = self.create_publisher(
             MotionDetection, 'toio/motion', qos_profile=10)
+        if self.publish_odom:
+            self.odom_pub = self.create_publisher(Odometry, 'odom', qos_profile=10)
+            self.odom_timer = self.create_timer(self.ODOM_PERIOD, self.odom_timer_callback)
 
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -786,9 +822,125 @@ class ToioNode(Node):
         toio_pose_stamped_msg = self.make_pose_stamped_msg(pos_x, pos_y, q_x, q_y, q_z, q_w)
         self.toio_pose_pub.publish(toio_pose_stamped_msg)
 
+        if self.publish_odom:
+            # The Position ID is the ground truth, so map -> odom is whatever
+            # makes the dead-reckoned odom -> center land on it. Published by
+            # odom_timer_callback() together with odom -> center.
+            _, _, yaw = euler_from_quaternion([q_x, q_y, q_z, q_w])
+            self._map_to_odom = self.compose_map_to_odom(
+                (pos_x, pos_y, yaw), self._odom_pose)
+            return
+
         # send the transformation
         toio_transform = self.make_toio_transform(pos_x, pos_y, q_x, q_y, q_z, q_w)
         self.tf_broadcaster.sendTransform(toio_transform)
+
+    @staticmethod
+    def compose_map_to_odom(map_pose, odom_pose):
+        """Return map->odom (x, y, yaw) given the same point in both frames."""
+        mx, my, myaw = map_pose
+        ox, oy, oyaw = odom_pose
+        yaw = math.atan2(math.sin(myaw - oyaw), math.cos(myaw - oyaw))
+        c, sn = math.cos(yaw), math.sin(yaw)
+        return (mx - (c * ox - sn * oy), my - (sn * ox + c * oy), yaw)
+
+    def speed_to_mps(self, speed: int) -> float:
+        """Convert a cube motor speed value to a wheel rim speed in m/s."""
+        rpm = speed / self.max_input_speed * self.max_rpm
+        return rpm / 60.0 * 2.0 * math.pi * self.wheel_radius
+
+    def wheel_velocities(self):
+        """Return the signed (left, right) wheel speeds in m/s."""
+        # The cube reports magnitudes only (verified on a real cube: reverse
+        # and spin both come back positive), so the sign comes from the last
+        # non-zero motor command. During a built-in target motion (goal_pose,
+        # dock_to_pose) the cube drives itself and the last cmd_vel sign is
+        # a guess; those motions are mostly forward, so a stale reverse
+        # command is the case that misleads the odometry.
+        left_dir, right_dir = self._wheel_dir
+        left, right = self._wheel_speed
+        return self.speed_to_mps(left) * left_dir, self.speed_to_mps(right) * right_dir
+
+    def integrate_odom(self, dt: float) -> tuple:
+        """Advance the odom pose by dt and return (v, omega)."""
+        v_l, v_r = self.wheel_velocities()
+        v = (v_l + v_r) / 2.0
+        omega = (v_r - v_l) / self.wheel_base
+        x, y, yaw = self._odom_pose
+        # midpoint heading keeps an arc from collapsing into a chord
+        mid = yaw + omega * dt / 2.0
+        x += v * math.cos(mid) * dt
+        y += v * math.sin(mid) * dt
+        yaw += omega * dt
+        yaw = math.atan2(math.sin(yaw), math.cos(yaw))
+        self._odom_pose = (x, y, yaw)
+        return v, omega
+
+    def odom_timer_callback(self) -> None:
+        now = self.get_clock().now()
+        if not self.is_connected:
+            # no speeds to integrate; the gap is not motion
+            self._last_odom_time = None
+            return
+        if self._last_odom_time is None:
+            self._last_odom_time = now
+            return
+        dt = (now - self._last_odom_time).nanoseconds * 1e-9
+        self._last_odom_time = now
+        v, omega = self.integrate_odom(dt)
+        stamp = now.to_msg()
+        self.odom_pub.publish(self.make_odom_msg(stamp, v, omega))
+        # both sent with one stamp so map -> center is consistent at any time
+        self.tf_broadcaster.sendTransform([
+            self.make_transform(stamp, 'map', self.frame_prefix + 'odom', *self._map_to_odom),
+            self.make_transform(stamp, self.frame_prefix + 'odom',
+                                self.frame_prefix + 'center', *self._odom_pose)])
+
+    @staticmethod
+    def make_transform(stamp, parent, child, x, y, yaw):
+        transform = TransformStamped()
+        transform.header.stamp = stamp
+        transform.header.frame_id = parent
+        transform.child_frame_id = child
+        transform.transform.translation.x = x
+        transform.transform.translation.y = y
+        transform.transform.translation.z = 0.0
+        q_x, q_y, q_z, q_w = quaternion_from_euler(0.0, 0.0, yaw)
+        transform.transform.rotation.x = q_x
+        transform.transform.rotation.y = q_y
+        transform.transform.rotation.z = q_z
+        transform.transform.rotation.w = q_w
+        return transform
+
+    def make_odom_msg(self, stamp, v, omega) -> Odometry:
+        msg = Odometry()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.frame_prefix + 'odom'
+        msg.child_frame_id = self.frame_prefix + 'center'
+        x, y, yaw = self._odom_pose
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        q_x, q_y, q_z, q_w = quaternion_from_euler(0.0, 0.0, yaw)
+        msg.pose.pose.orientation.x = q_x
+        msg.pose.pose.orientation.y = q_y
+        msg.pose.pose.orientation.z = q_z
+        msg.pose.pose.orientation.w = q_w
+        msg.twist.twist.linear.x = v
+        msg.twist.twist.angular.z = omega
+        # Dead reckoning drifts and the Position ID corrects it through
+        # map -> odom, so the pose here is only trusted over a short stretch.
+        # The unused dimensions (z, roll, pitch) are marked as such.
+        msg.pose.covariance = self.make_covariance(0.01, 0.01, 0.05)
+        msg.twist.covariance = self.make_covariance(0.001, 0.001, 0.01)
+        return msg
+
+    @staticmethod
+    def make_covariance(xx, yy, yawyaw):
+        unused = 1e6
+        cov = [0.0] * 36
+        for i, value in zip((0, 7, 14, 21, 28, 35), (xx, yy, unused, unused, unused, yawyaw)):
+            cov[i] = value
+        return cov
 
     def _on_sensor_notification(self, payload: bytearray) -> None:
         """Handle a sensor notification (called on the asyncio loop thread)."""
@@ -827,6 +979,12 @@ class ToioNode(Node):
                 self.horizontal_threshold)
         except Exception as e:
             self.get_logger().warn(f'horizontal threshold not applied: {e}')
+        if self.publish_odom:
+            try:
+                await self.cube.api.configuration.set_motor_speed_information_acquisition(
+                    MotorSpeedInformationAcquisitionState.Enable)
+            except Exception as e:
+                self.get_logger().warn(f'motor speed notification not enabled: {e}')
         try:
             # The cube only notifies changes, so a subscriber would otherwise
             # not know the posture until it changes. A read (instead of
@@ -929,6 +1087,10 @@ class ToioNode(Node):
     def _on_motor_notification(self, payload: bytearray) -> None:
         """Handle motor response notification (called on the asyncio loop thread)."""
         info = Motor.is_my_data(payload)
+        if isinstance(info, ResponseMotorSpeed):
+            # tuple assignment is atomic, read by odom_timer_callback()
+            self._wheel_speed = (info.left, info.right)
+            return
         # only motor_control_target results are reported (issue #9);
         # motor_control() used for cmd_vel does not send responses
         if not isinstance(info, ResponseMotorControlTarget):
@@ -963,6 +1125,8 @@ class ToioNode(Node):
             if not self.is_connected:
                 return
             self.is_connected = False
+        # no more speed notifications will arrive, and the cube auto-stops
+        self._wheel_speed = (0, 0)
         self.get_logger().error('toio is disconnected. reconnecting...')
         asyncio.run_coroutine_threadsafe(
             self.connect_toio(),
@@ -1082,6 +1246,9 @@ class ToioNode(Node):
                 duration_ms=self.MOTOR_DURATION_MS)
             self._last_motor_cmd = cmd
             self._last_motor_cmd_time = now
+            self._wheel_dir = tuple(
+                (-1 if speed < 0 else 1) if speed != 0 else direction
+                for speed, direction in zip(cmd, self._wheel_dir))
 
     async def motor_control_target(self, x, y, angle, timeout=None) -> None:
         self.get_logger().debug(f'motor_control_target(): x = {x}, y={y}, angle = {angle}')
@@ -1164,6 +1331,7 @@ class ToioNode(Node):
     async def shutdown_toio(self) -> None:
         if self.is_connected:
             self.is_connected = False  # stop motor_command_loop / watchdog sends
+            self._wheel_speed = (0, 0)
             # Unregister before the cleanup writes below: a SIGINT shuts the
             # rclpy context down before destroy_node() runs (see main()), so a
             # notification arriving while those BLE round-trips are in flight
