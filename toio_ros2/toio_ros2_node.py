@@ -28,7 +28,7 @@ from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile
-from sensor_msgs.msg import BatteryState
+from sensor_msgs.msg import BatteryState, Imu
 from std_msgs.msg import Bool, ColorRGBA, UInt8
 from tf2_ros import TransformBroadcaster
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
@@ -39,8 +39,11 @@ from toio import (Battery, BLEScanner, Color, CubeLocation, IdInformation,
                   RotationOption, SoundId, Speed, SpeedChangeType,
                   TargetPosition, ToioCoreCube)
 from toio.cube.api.configuration import (MotorSpeedInformationAcquisitionState,
+                                         PostureAngleDetectionCondition,
+                                         PostureAngleDetectionType,
                                          SetCollisionDetectionThreshold)
-from toio.cube.api.sensor import MotionDetectionData, Sensor
+from toio.cube.api.sensor import (MotionDetectionData, PostureAngleQuaternionsData,
+                                  Sensor)
 from toio_msgs.msg import Led, LedPattern, Melody, MotionDetection
 from toio_msgs.msg import MidiNote as MidiNoteMsg
 
@@ -234,6 +237,12 @@ class ToioNode(Node):
         # map -> center straight from the Position ID as it always did.
         self.declare_parameter('publish_odom', True)
 
+        # Posture angle (issue #44): the cube's orientation as sensor_msgs/Imu
+        # on /toio/imu, at imu_interval_ms (10ms steps, 0 disables). The cube
+        # reports it in an x-forward / y-right / z-down frame (checked on a
+        # real cube, see make_imu_msg()), converted to REP-103 here.
+        self.declare_parameter('imu_interval_ms', 100)
+
         # Visual / audible feedback (issue #28). led_duration_ms 0 keeps the
         # indicator lit until the next command; 10-2550 lets the cube turn it
         # off on its own (a fraction below 10ms is truncated and anything above
@@ -294,6 +303,8 @@ class ToioNode(Node):
             'horizontal_threshold').get_parameter_value().integer_value
         self.publish_odom = self.get_parameter(
             'publish_odom').get_parameter_value().bool_value
+        self.imu_interval_ms = self.get_parameter(
+            'imu_interval_ms').get_parameter_value().integer_value
         self.led_duration_ms = self.get_parameter(
             'led_duration_ms').get_parameter_value().integer_value
         self.sound_volume = self.get_parameter(
@@ -379,6 +390,8 @@ class ToioNode(Node):
         # that happened long ago
         self.motion_pub = self.create_publisher(
             MotionDetection, 'toio/motion', qos_profile=10)
+        if self.imu_interval_ms > 0:
+            self.imu_pub = self.create_publisher(Imu, 'toio/imu', qos_profile=10)
         if self.publish_odom:
             self.odom_pub = self.create_publisher(Odometry, 'odom', qos_profile=10)
             self.odom_timer = self.create_timer(self.ODOM_PERIOD, self.odom_timer_callback)
@@ -945,11 +958,35 @@ class ToioNode(Node):
     def _on_sensor_notification(self, payload: bytearray) -> None:
         """Handle a sensor notification (called on the asyncio loop thread)."""
         info = Sensor.is_my_data(payload)
-        # posture angle and magnetic sensor data share this characteristic
-        # and are not published (issues #44 and the magnetic sensor)
-        if not isinstance(info, MotionDetectionData):
-            return
-        self.motion_pub.publish(self.make_motion_msg(info))
+        if isinstance(info, MotionDetectionData):
+            self.motion_pub.publish(self.make_motion_msg(info))
+        elif isinstance(info, PostureAngleQuaternionsData) and self.imu_interval_ms > 0:
+            self.imu_pub.publish(self.make_imu_msg(info))
+        # Euler posture data (not requested) and magnetic sensor data share
+        # this characteristic and are not published
+
+    def make_imu_msg(self, info: PostureAngleQuaternionsData) -> Imu:
+        msg = Imu()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.frame_prefix + 'center'
+        # The cube's frame is x forward, y right, z down (on a real cube:
+        # nose up gives +pitch, right side up gives -roll, turning
+        # counter-clockwise gives -yaw). REP-103 wants x forward, y left,
+        # z up, which is a half turn about x, so y and z flip sign.
+        msg.orientation.w = info.w
+        msg.orientation.x = info.x
+        msg.orientation.y = -info.y
+        msg.orientation.z = -info.z
+        # Roll and pitch are gravity-referenced; yaw is integrated from the
+        # gyro with the power-on heading as zero and drifts by about 0.3
+        # deg/s at rest (measured), so it carries a far larger variance.
+        # Only the orientation is reported: -1 marks the other two absent.
+        msg.orientation_covariance = [0.01, 0.0, 0.0,
+                                      0.0, 0.01, 0.0,
+                                      0.0, 0.0, 1.0]
+        msg.angular_velocity_covariance[0] = -1.0
+        msg.linear_acceleration_covariance[0] = -1.0
+        return msg
 
     def make_motion_msg(self, info: MotionDetectionData) -> MotionDetection:
         msg = MotionDetection()
@@ -979,6 +1016,13 @@ class ToioNode(Node):
                 self.horizontal_threshold)
         except Exception as e:
             self.get_logger().warn(f'horizontal threshold not applied: {e}')
+        if self.imu_interval_ms > 0:
+            try:
+                await self.cube.api.configuration.set_posture_angle_detection(
+                    PostureAngleDetectionType.Quaternions, self.imu_interval_ms,
+                    PostureAngleDetectionCondition.Always)
+            except Exception as e:
+                self.get_logger().warn(f'posture angle notification not enabled: {e}')
         if self.publish_odom:
             try:
                 await self.cube.api.configuration.set_motor_speed_information_acquisition(
