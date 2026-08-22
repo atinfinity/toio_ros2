@@ -32,7 +32,7 @@ from tf_transformations import euler_from_quaternion
 from toio import MotorResponseCode, SoundId
 from toio.device_interface import CubeInfo
 
-from toio_msgs.msg import Led, LedPattern, Melody
+from toio_msgs.msg import Led, LedPattern, Melody, MotionDetection
 from toio_msgs.msg import MidiNote as MidiNoteMsg
 
 from toio_ros2.toio_ros2_node import AUTO_CONNECT_SCAN_NUM, ToioNode
@@ -103,6 +103,25 @@ def make_position_id_payload(x, y, angle):
 def make_position_id_missed_payload():
     # https://toio.github.io/toio-spec/en/docs/ble_id#position-id-missed
     return bytearray(struct.pack('<B', 0x03))
+
+
+def make_motion_payload(horizontal=1, collision=0, double_tap=0, posture=1, shake=0):
+    # https://toio.github.io/toio-spec/en/docs/ble_sensor#obtaining-motion-detection-information
+    return bytearray(struct.pack(
+        '<BBBBBB', 0x01, horizontal, collision, double_tap, posture, shake))
+
+
+def make_connectable_cube():
+    """Build a cube mock that connect_toio() can go through without BLE."""
+    cube = MagicMock()
+    cube.connect = AsyncMock()
+    for api in (cube.api.id_information, cube.api.battery, cube.api.motor,
+                cube.api.sensor):
+        api.register_notification_handler = AsyncMock()
+    cube.api.configuration._write = AsyncMock()
+    cube.api.configuration.set_horizontal_detection_threshold = AsyncMock()
+    cube.api.sensor.read = AsyncMock(return_value=None)
+    return cube
 
 
 def test_convert_toio_to_ros_coord(node):
@@ -347,6 +366,7 @@ def make_connected_cube_mock():
     cube.api.id_information.unregister_notification_handler = AsyncMock()
     cube.api.battery.unregister_notification_handler = AsyncMock()
     cube.api.motor.unregister_notification_handler = AsyncMock()
+    cube.api.sensor.unregister_notification_handler = AsyncMock()
     cube.disconnect = AsyncMock()
     return cube
 
@@ -514,10 +534,7 @@ def test_position_id_missed_is_reset_on_connect(node, monkeypatch, missed_before
         node._on_id_notification(make_position_id_missed_payload())
     node.position_id_missed_pub.publish.reset_mock()
 
-    cube = MagicMock()
-    cube.connect = AsyncMock()
-    for api in (cube.api.id_information, cube.api.battery, cube.api.motor):
-        api.register_notification_handler = AsyncMock()
+    cube = make_connectable_cube()
     monkeypatch.setattr('toio_ros2.toio_ros2_node.ToioCoreCube', lambda **kwargs: cube)
     monkeypatch.setattr(
         ToioNode, 'scan_toio',
@@ -530,6 +547,81 @@ def test_position_id_missed_is_reset_on_connect(node, monkeypatch, missed_before
     assert not node._position_id_missed
     # published even when nothing changed, so the latched topic has a value
     node.position_id_missed_pub.publish.assert_called_once_with(Bool(data=False))
+
+
+def test_motion_notification_publishes_motion(node):
+    node.motion_pub = MagicMock()
+
+    node._on_sensor_notification(make_motion_payload(
+        horizontal=0, collision=1, double_tap=0, posture=3, shake=4))
+
+    node.motion_pub.publish.assert_called_once()
+    msg = node.motion_pub.publish.call_args[0][0]
+    assert msg.header.frame_id == 'center'
+    assert msg.horizontal is False
+    assert msg.collision is True
+    assert msg.double_tap is False
+    assert msg.posture == MotionDetection.POSTURE_REAR
+    assert msg.shake == 4
+
+
+def test_motion_frame_uses_frame_prefix(node):
+    node.motion_pub = MagicMock()
+    node.frame_prefix = 'toio1/'
+    node._on_sensor_notification(make_motion_payload())
+    assert node.motion_pub.publish.call_args[0][0].header.frame_id == 'toio1/center'
+
+
+def test_other_sensor_notifications_are_not_published(node):
+    node.motion_pub = MagicMock()
+    # posture angle (Euler) shares the sensor characteristic
+    # https://toio.github.io/toio-spec/en/docs/ble_high_precision_tilt_sensor
+    node._on_sensor_notification(bytearray(struct.pack('<BBhhh', 0x03, 0x01, 0, 0, 0)))
+    # magnetic sensor
+    node._on_sensor_notification(bytearray(struct.pack('<BBBbbb', 0x02, 0, 0, 0, 0, 0)))
+    node.motion_pub.publish.assert_not_called()
+
+
+def test_connect_applies_thresholds_and_reads_motion(node, monkeypatch):
+    node.motion_pub = MagicMock()
+    node.collision_threshold = 3
+    node.horizontal_threshold = 20
+    cube = make_connectable_cube()
+    from toio.cube.api.sensor import MotionDetectionData
+    cube.api.sensor.read = AsyncMock(
+        return_value=MotionDetectionData(make_motion_payload(posture=2)))
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.ToioCoreCube', lambda **kwargs: cube)
+    monkeypatch.setattr(
+        ToioNode, 'scan_toio',
+        AsyncMock(return_value=make_cube_info('toio Core Cube-C7f', 'AA:BB')))
+
+    asyncio.run(REAL_CONNECT_TOIO(node))
+
+    # https://toio.github.io/toio-spec/en/docs/ble_configuration#collision-detection-threshold-settings
+    cube.api.configuration._write.assert_awaited_once_with(bytes((0x06, 0x00, 3)))
+    cube.api.configuration.set_horizontal_detection_threshold.assert_awaited_once_with(20)
+    cube.api.sensor.register_notification_handler.assert_awaited_once_with(
+        node._on_sensor_notification)
+    node.motion_pub.publish.assert_called_once()
+    assert node.motion_pub.publish.call_args[0][0].posture == MotionDetection.POSTURE_BOTTOM
+
+
+def test_connect_survives_motion_setup_failure(node, monkeypatch):
+    node.motion_pub = MagicMock()
+    cube = make_connectable_cube()
+    cube.api.configuration._write = AsyncMock(side_effect=RuntimeError('ble'))
+    cube.api.configuration.set_horizontal_detection_threshold = AsyncMock(
+        side_effect=RuntimeError('ble'))
+    cube.api.sensor.read = AsyncMock(side_effect=RuntimeError('ble'))
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.ToioCoreCube', lambda **kwargs: cube)
+    monkeypatch.setattr(
+        ToioNode, 'scan_toio',
+        AsyncMock(return_value=make_cube_info('toio Core Cube-C7f', 'AA:BB')))
+
+    asyncio.run(REAL_CONNECT_TOIO(node))
+
+    assert node.is_connected
+    node.motion_pub.publish.assert_not_called()
 
 
 def test_toio_transform_uses_frame_prefix(node):

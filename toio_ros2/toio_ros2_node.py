@@ -37,7 +37,9 @@ from toio import (Battery, BLEScanner, Color, CubeLocation, IdInformation,
                   ResponseMotorControlTarget,
                   RotationOption, SoundId, Speed, SpeedChangeType,
                   TargetPosition, ToioCoreCube)
-from toio_msgs.msg import Led, LedPattern, Melody
+from toio.cube.api.configuration import SetCollisionDetectionThreshold
+from toio.cube.api.sensor import MotionDetectionData, Sensor
+from toio_msgs.msg import Led, LedPattern, Melody, MotionDetection
 from toio_msgs.msg import MidiNote as MidiNoteMsg
 
 # Auto-connect mode reports up to this many nearby cubes as cube_id
@@ -188,6 +190,19 @@ class ToioNode(Node):
         # the cube's own target motion aborts with Position ID missed.
         self.declare_parameter('stop_on_position_id_missed', True)
 
+        # Collision detection sensitivity (issue #42), 1 (most sensitive) to
+        # 10, sent to the cube on every (re)connection. The cube default of 7
+        # needs a fairly hard knock; a cube bumping a wall at Nav2 speeds is
+        # gentler than that, so a deployment that relies on /toio/motion for
+        # obstacle contact will want a lower value. Out of range values are
+        # clipped by toio.py.
+        self.declare_parameter('collision_threshold', 7)
+        # Tilt in degrees beyond which `horizontal` in /toio/motion turns
+        # false, 1 to 45. The cube default of 45 only catches a cube that is
+        # nearly on its side; climbing onto another cube or a mat edge tilts
+        # it far less, so lower it when that is what the topic is for.
+        self.declare_parameter('horizontal_threshold', 45)
+
         # Visual / audible feedback (issue #28). led_duration_ms 0 keeps the
         # indicator lit until the next command; 10-2550 lets the cube turn it
         # off on its own (a fraction below 10ms is truncated and anything above
@@ -242,6 +257,10 @@ class ToioNode(Node):
             'enable_goal_pose_motion').get_parameter_value().bool_value
         self.stop_on_position_id_missed = self.get_parameter(
             'stop_on_position_id_missed').get_parameter_value().bool_value
+        self.collision_threshold = self.get_parameter(
+            'collision_threshold').get_parameter_value().integer_value
+        self.horizontal_threshold = self.get_parameter(
+            'horizontal_threshold').get_parameter_value().integer_value
         self.led_duration_ms = self.get_parameter(
             'led_duration_ms').get_parameter_value().integer_value
         self.sound_volume = self.get_parameter(
@@ -322,6 +341,11 @@ class ToioNode(Node):
         self.position_id_missed_pub = self.create_publisher(
             Bool, 'toio/position_id_missed',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # Not latched: collision and double_tap are momentary, and a late
+        # subscriber replaying a stale 'collision: true' would act on a bump
+        # that happened long ago
+        self.motion_pub = self.create_publisher(
+            MotionDetection, 'toio/motion', qos_profile=10)
 
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -766,6 +790,54 @@ class ToioNode(Node):
         toio_transform = self.make_toio_transform(pos_x, pos_y, q_x, q_y, q_z, q_w)
         self.tf_broadcaster.sendTransform(toio_transform)
 
+    def _on_sensor_notification(self, payload: bytearray) -> None:
+        """Handle a sensor notification (called on the asyncio loop thread)."""
+        info = Sensor.is_my_data(payload)
+        # posture angle and magnetic sensor data share this characteristic
+        # and are not published (issues #44 and the magnetic sensor)
+        if not isinstance(info, MotionDetectionData):
+            return
+        self.motion_pub.publish(self.make_motion_msg(info))
+
+    def make_motion_msg(self, info: MotionDetectionData) -> MotionDetection:
+        msg = MotionDetection()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.frame_prefix + 'center'
+        msg.horizontal = info.horizontal
+        msg.collision = info.collision
+        msg.double_tap = info.double_tap
+        msg.posture = int(info.posture)
+        msg.shake = int(info.shake)
+        return msg
+
+    async def setup_motion_detection(self) -> None:
+        """Apply the detection thresholds and publish the motion state once."""
+        # None of these is worth failing the connection over, so errors are
+        # logged and the cube stays connected with its previous settings.
+        try:
+            # toio.py 1.1.0's Configuration.set_collision_detection_threshold()
+            # sends the horizontal threshold command by mistake, so the
+            # command is written directly
+            await self.cube.api.configuration._write(
+                bytes(SetCollisionDetectionThreshold(self.collision_threshold)))
+        except Exception as e:
+            self.get_logger().warn(f'collision threshold not applied: {e}')
+        try:
+            await self.cube.api.configuration.set_horizontal_detection_threshold(
+                self.horizontal_threshold)
+        except Exception as e:
+            self.get_logger().warn(f'horizontal threshold not applied: {e}')
+        try:
+            # The cube only notifies changes, so a subscriber would otherwise
+            # not know the posture until it changes. A read (instead of
+            # request_motion_information()) returns the state directly
+            # rather than through the notification handler.
+            info = await self.cube.api.sensor.read()
+            if isinstance(info, MotionDetectionData):
+                self.motion_pub.publish(self.make_motion_msg(info))
+        except Exception as e:
+            self.get_logger().warn(f'motion state not read: {e}')
+
     def set_position_id_missed(self, missed: bool) -> None:
         """Update the Position ID missed state, publishing it when it changes."""
         if missed == self._position_id_missed:
@@ -935,6 +1007,9 @@ class ToioNode(Node):
                     self._on_battery_notification)
                 await self.cube.api.motor.register_notification_handler(
                     self._on_motor_notification)
+                await self.cube.api.sensor.register_notification_handler(
+                    self._on_sensor_notification)
+                await self.setup_motion_detection()
                 # the indicator state after a reconnection is not guaranteed to
                 # match the last requested color, so let led_command_loop()
                 # write it again (an identical write is harmless)
@@ -1097,6 +1172,7 @@ class ToioNode(Node):
             await self.cube.api.id_information.unregister_notification_handler(None)
             await self.cube.api.battery.unregister_notification_handler(None)
             await self.cube.api.motor.unregister_notification_handler(None)
+            await self.cube.api.sensor.unregister_notification_handler(None)
             await self.cube.api.motor.motor_control(0, 0)
             # do not leave the cube lit or buzzing after the node exits, but
             # keep disconnecting when the cube no longer answers
