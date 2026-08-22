@@ -152,7 +152,41 @@ Visualization Manager:
       Filter (whitelist): ""
       Frame Timeout: 15
       Frames:
-        All Enabled: true
+        All Enabled: false
+        map:
+          Value: true
+        toio1/base_footprint:
+          Value: true
+        toio1/base_l_drive_wheel_link:
+          Value: true
+        toio1/base_link:
+          Value: true
+        toio1/base_r_drive_wheel_link:
+          Value: true
+        toio1/center:
+          Value: true
+        toio1/led_link:
+          Value: true
+        toio1/odom:
+          Value: false
+        toio1/rear_caster_link:
+          Value: true
+        toio2/base_footprint:
+          Value: true
+        toio2/base_l_drive_wheel_link:
+          Value: true
+        toio2/base_link:
+          Value: true
+        toio2/base_r_drive_wheel_link:
+          Value: true
+        toio2/center:
+          Value: true
+        toio2/led_link:
+          Value: true
+        toio2/odom:
+          Value: false
+        toio2/rear_caster_link:
+          Value: true
       Marker Scale: 1
       Name: TF
       Show Arrows: true
