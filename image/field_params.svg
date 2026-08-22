@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="520" viewBox="0 0 760 520" font-family="Helvetica, Arial, sans-serif" font-size="14">
+  <rect width="760" height="520" fill="#ffffff"/>
+  <defs>
+    <marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#333"/></marker>
+    <marker id="b" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#c0392b"/></marker>
+  </defs>
+
+  <!-- play mat -->
+  <rect x="120" y="70" width="560" height="380" fill="#f4efe4" stroke="#b9ad95"/>
+  <text x="130" y="90" fill="#8a7d62">toio play mat (Position ID)</text>
+
+  <!-- Position ID axes (x right, y down) -->
+  <line x1="120" y1="70" x2="230" y2="70" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="236" y="75" fill="#333">Position ID x</text>
+  <line x1="120" y1="70" x2="120" y2="180" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="30" y="186" fill="#333">Position ID y</text>
+
+  <!-- field -->
+  <rect x="200" y="130" width="400" height="280" fill="#e8f1fb" stroke="#2c6fb0" stroke-width="2"/>
+  <text x="210" y="150" fill="#2c6fb0" font-weight="bold">field</text>
+
+  <!-- field param labels -->
+  <text x="200" y="122" fill="#2c6fb0" text-anchor="middle">field_min_x (98)</text>
+  <text x="600" y="122" fill="#2c6fb0" text-anchor="middle">field_max_x (402)</text>
+  <text x="195" y="135" fill="#2c6fb0" text-anchor="end">field_min_y (142)</text>
+  <text x="195" y="415" fill="#2c6fb0" text-anchor="end">field_max_y (358)</text>
+
+  <!-- width / height in meters -->
+  <line x1="200" y1="430" x2="600" y2="430" stroke="#2c6fb0" stroke-dasharray="4 3"/>
+  <line x1="200" y1="424" x2="200" y2="436" stroke="#2c6fb0"/>
+  <line x1="600" y1="424" x2="600" y2="436" stroke="#2c6fb0"/>
+  <text x="400" y="446" fill="#2c6fb0" text-anchor="middle">field_width_meter (0.297 m)</text>
+  <line x1="620" y1="130" x2="620" y2="410" stroke="#2c6fb0" stroke-dasharray="4 3"/>
+  <line x1="614" y1="130" x2="626" y2="130" stroke="#2c6fb0"/>
+  <line x1="614" y1="410" x2="626" y2="410" stroke="#2c6fb0"/>
+  <text x="0" y="0" fill="#2c6fb0" text-anchor="middle" transform="translate(636,270) rotate(-90)">field_height_meter (0.210 m)</text>
+
+  <!-- goal_boundary_margin -->
+  <rect x="240" y="170" width="320" height="200" fill="none" stroke="#c0392b" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="400" y="300" fill="#c0392b" text-anchor="middle">goal_pose / dock_to_pose targets are clamped into here</text>
+  <line x1="200" y1="390" x2="240" y2="390" stroke="#c0392b" stroke-width="1.5" marker-end="url(#b)"/>
+  <line x1="240" y1="390" x2="200" y2="390" stroke="#c0392b" stroke-width="1.5" marker-end="url(#b)"/>
+  <text x="248" y="395" fill="#c0392b">goal_boundary_margin (10)</text>
+
+  <!-- map frame at field_min corner: x right, y up -->
+  <circle cx="200" cy="130" r="4" fill="#1e8449"/>
+  <line x1="200" y1="130" x2="290" y2="130" stroke="#1e8449" stroke-width="2.5" marker-end="url(#a)"/>
+  <text x="296" y="135" fill="#1e8449" font-weight="bold">map x</text>
+  <line x1="200" y1="130" x2="200" y2="40" stroke="#1e8449" stroke-width="2.5" marker-end="url(#a)"/>
+  <text x="206" y="45" fill="#1e8449" font-weight="bold">map y</text>
+  <text x="208" y="168" fill="#1e8449">map origin (0, 0)</text>
+
+  <!-- legend -->
+  <text x="120" y="478" fill="#333">Position ID y grows downward on the mat, map y grows upward:</text>
+  <text x="120" y="498" fill="#333" font-family="monospace" font-size="13">map_x = (x - field_min_x) * field_width_meter / (field_max_x - field_min_x)</text>
+  <text x="120" y="514" fill="#333" font-family="monospace" font-size="13">map_y = -(y - field_min_y) * field_height_meter / (field_max_y - field_min_y)</text>
+</svg>
