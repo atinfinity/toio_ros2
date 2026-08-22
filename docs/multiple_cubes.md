@@ -16,7 +16,8 @@ Topics are namespaced (`/toio1/cmd_vel`, `/toio1/toio/pose`, ...) and TF uses
 one tree with the shared `map` frame and per-cube prefixed frames
 (`toio1/odom`, `toio1/center`, `toio2/odom`, `toio2/center`, ...). RViz2 starts with
 [rviz/toio_multi.rviz](../rviz/toio_multi.rviz), which shows the pose and robot
-model of both cubes (the "2D Goal Pose" tool sends to `/toio1/goal_pose`;
+model of both cubes (the "2D Goal Pose" tool sends to `/toio1/goal_pose`,
+which moves the cube only with `enable_goal_pose_motion:=true`;
 change the topic in the tool properties to command the other cube).
 
 The four node-parameter arguments of `toio_ros2_bringup.launch.py`

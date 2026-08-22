@@ -44,6 +44,11 @@ Launch the node (it connects to the nearest cube and opens RViz2):
 ros2 launch toio_ros2 toio_ros2_bringup.launch.py
 ```
 
+To send the cube to a point with RViz2's "2D Goal Pose" tool (the cube's
+built-in target motion), launch with `enable_goal_pose_motion:=true`. It is
+off by default because that motion would fight Nav2 / Open-RMF `cmd_vel`; see
+[docs/interfaces.md](docs/interfaces.md#goal_pose-vs-dock_to_pose).
+
 Drive the cube from the keyboard:
 
 ```bash

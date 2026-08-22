@@ -27,7 +27,7 @@ from launch_ros.actions import Node
 # Node parameters forwarded to every per-robot toio_ros2_bringup include,
 # with the defaults of that launch file (and of the node)
 NODE_PARAM_ARGS = {
-    'enable_goal_pose_motion': 'true',
+    'enable_goal_pose_motion': 'false',
     'publish_odom': 'true',
     'stop_on_position_id_missed': 'true',
     'stop_on_button': 'false',

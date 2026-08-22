@@ -67,10 +67,11 @@ def generate_launch_description():
     # therefore override a value set in that file.
     declare_enable_goal_pose_motion_cmd = DeclareLaunchArgument(
         name='enable_goal_pose_motion',
-        default_value='true',
-        description='Subscribe goal_pose for the cube built-in target motion. '
-                    'Set to false when Nav2 / Open-RMF owns the motion plan '
-                    '(RViz "2D Goal Pose" publishes goal_pose too)')
+        default_value='false',
+        description='Subscribe goal_pose for the cube built-in target motion '
+                    '(RViz "2D Goal Pose" publishes goal_pose). Off by default '
+                    'so that it cannot fight Nav2 / Open-RMF cmd_vel; set to '
+                    'true to drive the cube from RViz without Nav2')
     declare_publish_odom_cmd = DeclareLaunchArgument(
         name='publish_odom',
         default_value='true',

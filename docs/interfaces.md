@@ -12,7 +12,7 @@ Topics, action servers and parameters of `toio_ros2_node`.
 |topic name|Type|Description|
 |:---|:---|:---|
 |/cmd_vel|[geometry_msgs/msg/Twist](https://docs.ros2.org/foxy/api/geometry_msgs/msg/Twist.html)|desired robot velocity|
-|/goal_pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|desired robot pose (cube built-in target motion; disabled when `enable_goal_pose_motion` is false)|
+|/goal_pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|desired robot pose, driven by the cube built-in target motion. Only subscribed when `enable_goal_pose_motion` is true (off by default)|
 |/toio/led|[std_msgs/msg/ColorRGBA](https://docs.ros2.org/foxy/api/std_msgs/msg/ColorRGBA.html)|indicator color. `r`/`g`/`b` are 0.0-1.0 and scaled to the cube range of 0-255 (`a` is unused); all zero turns the indicator off|
 |/toio/sound|[std_msgs/msg/UInt8](https://docs.ros2.org/foxy/api/std_msgs/msg/UInt8.html)|[sound effect ID](https://toio.github.io/toio-spec/docs/ble_sound) (0-10). An out-of-range ID is ignored with a warning|
 |/toio/led_timed|[toio_msgs/msg/Led](https://github.com/atinfinity/toio_msgs)|indicator color with a per-command lighting time, for when `led_duration_ms` is not the same for every command|
@@ -54,10 +54,11 @@ dock cannot drive the cube off the pose it just reached.
 
 ### `goal_pose` vs `dock_to_pose`
 
-`enable_goal_pose_motion: false` exists so that an external traffic authority
-(Open-RMF) owns every motion plan: the `goal_pose` topic lets anyone make the
-cube drive a built-in target motion along a path the planner does not know
-about, at a time the planner did not choose. `dock_to_pose` is exempt because
+`enable_goal_pose_motion` is off by default so that an external planner
+(Nav2, Open-RMF) owns every motion plan: the `goal_pose` topic lets anyone -
+including RViz's "2D Goal Pose" tool - make the cube drive a built-in target
+motion along a path the planner does not know about, at a time the planner
+did not choose. Switch it on only for the standalone bringup without Nav2. `dock_to_pose` is exempt because
 it inverts all three properties - the traffic authority issues it itself, at a
 waypoint it has already reserved, over a few centimetres, and it waits for the
 result before doing anything else. It therefore stays available regardless of
@@ -124,7 +125,7 @@ downward on the mat). A `goal_pose` / `dock_to_pose` target is clamped to stay
 |horizontal_threshold|int|45|tilt in degrees beyond which `horizontal` in `/toio/motion` turns `false`, 1-45, sent to the cube on every (re)connection. The cube default of 45 only catches a cube nearly on its side; lower it to detect climbing onto another cube or a mat edge|
 |imu_interval_ms|int|100|notification interval of the posture angle behind `/toio/imu`, in 10ms steps (10-2550). 0 disables the topic and the notification|
 |publish_odom|bool|true|publish `/odom` and the `map` → `odom` → `center` TF tree from the cube's wheel speed notification. Set to false for the plain `map` → `center` transform|
-|enable_goal_pose_motion|bool|true|subscribe `goal_pose` and use the cube built-in target motion. Set to false when an external traffic authority (e.g. Open-RMF) owns the motion plan and all movement must go through Nav2 `cmd_vel`. Does not affect the `dock_to_pose` action|
+|enable_goal_pose_motion|bool|false|subscribe `goal_pose` and use the cube built-in target motion. Off by default because RViz's "2D Goal Pose" publishes `goal_pose` and the built-in motion would fight Nav2 / Open-RMF `cmd_vel`; set to true to drive the cube from RViz without Nav2. Does not affect the `dock_to_pose` action|
 |led_duration_ms|int|0|lighting time of `/toio/led`. 0 keeps the indicator lit until the next command, 10-2550 lets the cube turn it off on its own (a fraction below 10ms is truncated, anything above 2550ms is clipped)|
 |sound_volume|int|255|volume of `/toio/sound`. Per the [toio spec](https://toio.github.io/toio-spec/docs/ble_sound) this is mute or full volume only: 0 is mute and every other value is the maximum volume|
 
@@ -136,12 +137,12 @@ declares the parameters a deployment switches per launch, with the node's
 defaults:
 
 ```bash
-ros2 launch toio_ros2 toio_ros2_bringup.launch.py enable_goal_pose_motion:=false use_rviz:=false
+ros2 launch toio_ros2 toio_ros2_bringup.launch.py enable_goal_pose_motion:=true
 ```
 
 |launch argument|Default|
 |:---|:---|
-|enable_goal_pose_motion|true|
+|enable_goal_pose_motion|false|
 |publish_odom|true|
 |stop_on_position_id_missed|true|
 |stop_on_button|false|
