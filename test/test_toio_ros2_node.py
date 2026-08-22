@@ -20,6 +20,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from diagnostic_msgs.msg import DiagnosticStatus
+from diagnostic_updater import DiagnosticStatusWrapper
 from geometry_msgs.msg import PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 import pytest
@@ -124,6 +126,7 @@ def make_connectable_cube():
     cube.api.configuration.set_motor_speed_information_acquisition = AsyncMock()
     cube.api.configuration.set_posture_angle_detection = AsyncMock()
     cube.api.sensor.read = AsyncMock(return_value=None)
+    cube.api.sensor.request_motion_information = AsyncMock()
     return cube
 
 
@@ -664,6 +667,79 @@ def test_connect_survives_motion_setup_failure(node, monkeypatch):
 
     assert node.is_connected
     node.motion_pub.publish.assert_not_called()
+
+
+def run_diagnostic(task):
+    return task(DiagnosticStatusWrapper())
+
+
+def values(stat):
+    return {kv.key: kv.value for kv in stat.values}
+
+
+def test_diagnostics_connection(node):
+    stat = run_diagnostic(node.diagnose_connection)
+    assert stat.level == DiagnosticStatus.ERROR
+    assert values(stat)['connected'] == 'False'
+
+    node.is_connected = True
+    node._cube_name = 'toio-abc (AA:BB)'
+    stat = run_diagnostic(node.diagnose_connection)
+    assert stat.level == DiagnosticStatus.OK
+    assert values(stat)['cube'] == 'toio-abc (AA:BB)'
+
+    node._docking = True
+    stat = run_diagnostic(node.diagnose_connection)
+    assert stat.level == DiagnosticStatus.OK
+    assert 'docking' in stat.message
+
+
+def test_diagnostics_battery_levels(node):
+    assert run_diagnostic(node.diagnose_battery).level == DiagnosticStatus.WARN  # unknown yet
+    for level, expected in ((100, DiagnosticStatus.OK), (30, DiagnosticStatus.OK),
+                            (20, DiagnosticStatus.WARN), (10, DiagnosticStatus.ERROR)):
+        node._battery_level = level
+        stat = run_diagnostic(node.diagnose_battery)
+        assert stat.level == expected, level
+        assert values(stat)['level_percent'] == str(level)
+
+
+def test_battery_notification_feeds_the_diagnostics(node):
+    node.toio_battery_state_pub = MagicMock()
+    # https://toio.github.io/toio-spec/en/docs/ble_battery
+    node._on_battery_notification(bytearray(struct.pack('<B', 20)))
+    assert node._battery_level == 20
+
+
+def test_diagnostics_position(node):
+    assert run_diagnostic(node.diagnose_position).level == DiagnosticStatus.WARN  # no pose yet
+
+    node._last_pose_xy = (0.1, 0.2)
+    stat = run_diagnostic(node.diagnose_position)
+    assert stat.level == DiagnosticStatus.OK
+    assert values(stat)['x'] == '0.100'
+
+    node.position_id_missed_pub = MagicMock()
+    node._on_id_notification(make_position_id_missed_payload())
+    stat = run_diagnostic(node.diagnose_position)
+    assert stat.level == DiagnosticStatus.WARN
+    assert 'missed' in stat.message
+
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+    node.motion_pub = MagicMock()
+    node._on_sensor_notification(make_motion_payload(horizontal=0, posture=4))
+    stat = run_diagnostic(node.diagnose_position)
+    assert stat.level == DiagnosticStatus.WARN
+    assert 'tilted' in stat.message
+    assert values(stat)['posture'] == 'Front'
+
+    node._on_sensor_notification(make_motion_payload(horizontal=1, posture=1))
+    assert run_diagnostic(node.diagnose_position).level == DiagnosticStatus.OK
+
+
+def test_diagnostics_tasks_are_registered(node):
+    names = [task.name for task in node.diagnostic_updater.tasks]
+    assert names == ['connection', 'battery', 'position']
 
 
 def make_button_payload(pressed):
@@ -1507,3 +1583,21 @@ def test_led_pattern_and_melody_ignored_when_disconnected(node, scheduled):
     node.melody_callback(melody)
 
     assert not scheduled
+
+
+def test_connect_requests_motion_when_the_read_returns_something_else(node, monkeypatch):
+    node.motion_pub = MagicMock()
+    cube = make_connectable_cube()
+    # the characteristic is shared with the posture angle
+    from toio.cube.api.sensor import PostureAngleQuaternionsData
+    cube.api.sensor.read = AsyncMock(return_value=PostureAngleQuaternionsData(
+        make_posture_quaternion_payload(1.0, 0.0, 0.0, 0.0)))
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.ToioCoreCube', lambda **kwargs: cube)
+    monkeypatch.setattr(
+        ToioNode, 'scan_toio',
+        AsyncMock(return_value=make_cube_info('toio Core Cube-C7f', 'AA:BB')))
+
+    asyncio.run(REAL_CONNECT_TOIO(node))
+
+    cube.api.sensor.request_motion_information.assert_awaited_once()
+    node.motion_pub.publish.assert_not_called()
