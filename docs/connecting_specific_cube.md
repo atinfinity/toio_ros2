@@ -18,6 +18,11 @@ so you can find your `cube_id` there:
 [INFO] [toio_ros2_node]: found cube: toio-a7D (toio Core Cube) (XXXXXXXX-...)
 ```
 
+If several cubes show up and you are not sure which one is yours, the simplest
+way is to power on only your cube and run the node once: the single `found cube`
+line is yours. Alternatively, note the names with your cube switched off, then
+switch it on and run the node again - the name that newly appears is your cube.
+
 ```bash
 ros2 run toio_ros2 toio_ros2_node --ros-args -p cube_id:=a7D
 ```
