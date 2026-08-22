@@ -38,6 +38,7 @@ from toio import (Battery, BLEScanner, Color, CubeLocation, IdInformation,
                   ResponseMotorControlTarget, ResponseMotorSpeed,
                   RotationOption, SoundId, Speed, SpeedChangeType,
                   TargetPosition, ToioCoreCube)
+from toio.cube.api.button import Button, ButtonInformation, ButtonState
 from toio.cube.api.configuration import (MotorSpeedInformationAcquisitionState,
                                          PostureAngleDetectionCondition,
                                          PostureAngleDetectionType,
@@ -149,6 +150,10 @@ class ToioNode(Node):
         # cube while it is away.
         self._position_id_missed = False
 
+        # Button state (issue #45), from the cube's notification on change
+        # and a read on every (re)connection
+        self._button_pressed = False
+
         # Wheel odometry (issue #43). The cube reports the wheel speeds as
         # unsigned magnitudes in the motor command unit, so the direction is
         # taken from the last motor command sent (see wheel_velocities()).
@@ -243,6 +248,12 @@ class ToioNode(Node):
         # real cube, see make_imu_msg()), converted to REP-103 here.
         self.declare_parameter('imu_interval_ms', 100)
 
+        # Button (issue #45). With stop_on_button the cube button works as a
+        # hold-to-stop: while it is pressed the motor gets a stop instead of
+        # cmd_vel, the same way as stop_on_position_id_missed. The newest
+        # cmd_vel is kept, so releasing the button resumes the motion.
+        self.declare_parameter('stop_on_button', False)
+
         # Visual / audible feedback (issue #28). led_duration_ms 0 keeps the
         # indicator lit until the next command; 10-2550 lets the cube turn it
         # off on its own (a fraction below 10ms is truncated and anything above
@@ -305,6 +316,8 @@ class ToioNode(Node):
             'publish_odom').get_parameter_value().bool_value
         self.imu_interval_ms = self.get_parameter(
             'imu_interval_ms').get_parameter_value().integer_value
+        self.stop_on_button = self.get_parameter(
+            'stop_on_button').get_parameter_value().bool_value
         self.led_duration_ms = self.get_parameter(
             'led_duration_ms').get_parameter_value().integer_value
         self.sound_volume = self.get_parameter(
@@ -384,6 +397,11 @@ class ToioNode(Node):
         # about it, since the next message only comes when the state flips.
         self.position_id_missed_pub = self.create_publisher(
             Bool, 'toio/position_id_missed',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        # Latched like position_id_missed: the button is a state, notified on
+        # change only, and a late subscriber must still see a held button
+        self.button_pub = self.create_publisher(
+            Bool, 'toio/button',
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         # Not latched: collision and double_tap are momentary, and a late
         # subscriber replaying a stale 'collision: true' would act on a bump
@@ -797,9 +815,9 @@ class ToioNode(Node):
         for param in params:
             if param.name in self.SEND_INTERVAL_BOUNDS:
                 setattr(self, param.name, param.value)
-            elif param.name == 'stop_on_position_id_missed':
-                # pending_motor_cmd() reads this every tick
-                self.stop_on_position_id_missed = param.value
+            elif param.name in ('stop_on_position_id_missed', 'stop_on_button'):
+                # pending_motor_cmd() reads these every tick
+                setattr(self, param.name, param.value)
         return SetParametersResult(successful=True)
 
     @staticmethod
@@ -965,6 +983,16 @@ class ToioNode(Node):
         # Euler posture data (not requested) and magnetic sensor data share
         # this characteristic and are not published
 
+    def _on_button_notification(self, payload: bytearray) -> None:
+        """Handle a button notification (called on the asyncio loop thread)."""
+        info = Button.is_my_data(payload)
+        if isinstance(info, ButtonInformation):
+            self.set_button_pressed(info.state == ButtonState.PRESSED)
+
+    def set_button_pressed(self, pressed: bool) -> None:
+        self._button_pressed = pressed
+        self.button_pub.publish(Bool(data=pressed))
+
     def make_imu_msg(self, info: PostureAngleQuaternionsData) -> Imu:
         msg = Imu()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -998,6 +1026,18 @@ class ToioNode(Node):
         msg.posture = int(info.posture)
         msg.shake = int(info.shake)
         return msg
+
+    async def publish_button_state(self) -> None:
+        """Read the button once, since the cube only notifies changes."""
+        try:
+            info = await self.cube.api.button.read()
+            pressed = isinstance(info, ButtonInformation) and info.state == ButtonState.PRESSED
+        except Exception as e:
+            # not worth failing the connection over; assume released so a
+            # stale 'pressed' cannot hold the motor
+            self.get_logger().warn(f'button state not read: {e}')
+            pressed = False
+        self.set_button_pressed(pressed)
 
     async def setup_motion_detection(self) -> None:
         """Apply the detection thresholds and publish the motion state once."""
@@ -1217,7 +1257,10 @@ class ToioNode(Node):
                     self._on_motor_notification)
                 await self.cube.api.sensor.register_notification_handler(
                     self._on_sensor_notification)
+                await self.cube.api.button.register_notification_handler(
+                    self._on_button_notification)
                 await self.setup_motion_detection()
+                await self.publish_button_state()
                 # the indicator state after a reconnection is not guaranteed to
                 # match the last requested color, so let led_command_loop()
                 # write it again (an identical write is harmless)
@@ -1252,6 +1295,9 @@ class ToioNode(Node):
         # stop_on_position_id_missed). The stop is sent instead of skipping
         # the tick so a cube that ran off the edge actually halts.
         if self._position_id_missed and self.stop_on_position_id_missed:
+            return (0, 0)
+        # hold-to-stop on the cube button (see stop_on_button)
+        if self._button_pressed and self.stop_on_button:
             return (0, 0)
         # Send stop when cmd_vel goes silent, keeping the auto-stop
         # semantics of duration_ms=500
@@ -1385,6 +1431,7 @@ class ToioNode(Node):
             await self.cube.api.battery.unregister_notification_handler(None)
             await self.cube.api.motor.unregister_notification_handler(None)
             await self.cube.api.sensor.unregister_notification_handler(None)
+            await self.cube.api.button.unregister_notification_handler(None)
             await self.cube.api.motor.motor_control(0, 0)
             # do not leave the cube lit or buzzing after the node exits, but
             # keep disconnecting when the cube no longer answers
