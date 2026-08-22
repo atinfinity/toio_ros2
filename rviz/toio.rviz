@@ -119,7 +119,25 @@ Visualization Manager:
       Filter (whitelist): ""
       Frame Timeout: 15
       Frames:
-        All Enabled: true
+        All Enabled: false
+        base_footprint:
+          Value: true
+        base_l_drive_wheel_link:
+          Value: true
+        base_link:
+          Value: true
+        base_r_drive_wheel_link:
+          Value: true
+        center:
+          Value: true
+        led_link:
+          Value: true
+        map:
+          Value: true
+        odom:
+          Value: false
+        rear_caster_link:
+          Value: true
       Marker Scale: 1
       Name: TF
       Show Arrows: true
