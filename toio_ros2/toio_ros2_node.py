@@ -17,6 +17,8 @@ import math
 import threading
 import time
 
+from diagnostic_msgs.msg import DiagnosticStatus
+from diagnostic_updater import DiagnosticStatusWrapper, Updater
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
@@ -153,6 +155,13 @@ class ToioNode(Node):
         # Button state (issue #45), from the cube's notification on change
         # and a read on every (re)connection
         self._button_pressed = False
+
+        # Read by the diagnostics (issue #46): the last battery level (None
+        # until the cube's first notification), the connected cube's name and
+        # the last motion detection
+        self._battery_level = None
+        self._cube_name = ''
+        self._last_motion = None
 
         # Wheel odometry (issue #43). The cube reports the wheel speeds as
         # unsigned magnitudes in the motor command unit, so the direction is
@@ -416,6 +425,15 @@ class ToioNode(Node):
 
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
+
+        # Diagnostics (issue #46) on /diagnostics for rqt_robot_monitor and
+        # fleet-side monitoring. The publish period is the updater's own
+        # 'diagnostic_updater.period' parameter (1s by default).
+        self.diagnostic_updater = Updater(self)
+        self.diagnostic_updater.setHardwareID('toio')
+        self.diagnostic_updater.add('connection', self.diagnose_connection)
+        self.diagnostic_updater.add('battery', self.diagnose_battery)
+        self.diagnostic_updater.add('position', self.diagnose_position)
 
         # action server
         #
@@ -977,11 +995,66 @@ class ToioNode(Node):
         """Handle a sensor notification (called on the asyncio loop thread)."""
         info = Sensor.is_my_data(payload)
         if isinstance(info, MotionDetectionData):
+            self._last_motion = info
             self.motion_pub.publish(self.make_motion_msg(info))
         elif isinstance(info, PostureAngleQuaternionsData) and self.imu_interval_ms > 0:
             self.imu_pub.publish(self.make_imu_msg(info))
         # Euler posture data (not requested) and magnetic sensor data share
         # this characteristic and are not published
+
+    # Diagnostic tasks. Each takes the DiagnosticStatusWrapper the updater
+    # hands it, fills summary and values and returns it. They run on the
+    # updater's timer and only read state that the other threads assign
+    # atomically.
+    BATTERY_WARN_LEVEL = 20  # percent
+    BATTERY_ERROR_LEVEL = 10  # percent
+
+    def diagnose_connection(self, stat: DiagnosticStatusWrapper) -> DiagnosticStatusWrapper:
+        if not self.is_connected:
+            stat.summary(DiagnosticStatus.ERROR, 'disconnected, reconnecting')
+        elif self._docking:
+            stat.summary(DiagnosticStatus.OK, 'connected, docking')
+        else:
+            stat.summary(DiagnosticStatus.OK, 'connected')
+        stat.add('connected', str(self.is_connected))
+        stat.add('cube', self._cube_name)
+        stat.add('docking', str(self._docking))
+        stat.add('button_pressed', str(self._button_pressed))
+        return stat
+
+    def diagnose_battery(self, stat: DiagnosticStatusWrapper) -> DiagnosticStatusWrapper:
+        level = self._battery_level
+        if level is None:
+            # the cube reports the battery every few seconds, so this is
+            # only the window right after a connection
+            stat.summary(DiagnosticStatus.WARN, 'battery level not reported yet')
+        elif level <= self.BATTERY_ERROR_LEVEL:
+            stat.summary(DiagnosticStatus.ERROR, f'battery {level}%, charge now')
+        elif level <= self.BATTERY_WARN_LEVEL:
+            stat.summary(DiagnosticStatus.WARN, f'battery {level}%, low')
+        else:
+            stat.summary(DiagnosticStatus.OK, f'battery {level}%')
+        stat.add('level_percent', '' if level is None else str(level))
+        return stat
+
+    def diagnose_position(self, stat: DiagnosticStatusWrapper) -> DiagnosticStatusWrapper:
+        motion = self._last_motion
+        if self._position_id_missed:
+            stat.summary(DiagnosticStatus.WARN, 'Position ID missed, the cube cannot read the mat')
+        elif motion is not None and not motion.horizontal:
+            stat.summary(DiagnosticStatus.WARN, 'cube is tilted')
+        elif self._last_pose_xy is None:
+            stat.summary(DiagnosticStatus.WARN, 'no Position ID received yet')
+        else:
+            stat.summary(DiagnosticStatus.OK, 'Position ID ok')
+        stat.add('position_id_missed', str(self._position_id_missed))
+        if self._last_pose_xy is not None:
+            stat.add('x', f'{self._last_pose_xy[0]:.3f}')
+            stat.add('y', f'{self._last_pose_xy[1]:.3f}')
+        if motion is not None:
+            stat.add('horizontal', str(motion.horizontal))
+            stat.add('posture', motion.posture.name)
+        return stat
 
     def _on_button_notification(self, payload: bytearray) -> None:
         """Handle a button notification (called on the asyncio loop thread)."""
@@ -1071,12 +1144,17 @@ class ToioNode(Node):
                 self.get_logger().warn(f'motor speed notification not enabled: {e}')
         try:
             # The cube only notifies changes, so a subscriber would otherwise
-            # not know the posture until it changes. A read (instead of
-            # request_motion_information()) returns the state directly
-            # rather than through the notification handler.
+            # not know the posture until it changes. A read returns the state
+            # directly, but the characteristic is shared with the posture
+            # angle, so once that notification is on the read may return an
+            # angle instead; the request then makes the cube notify the
+            # motion state through _on_sensor_notification().
             info = await self.cube.api.sensor.read()
             if isinstance(info, MotionDetectionData):
+                self._last_motion = info
                 self.motion_pub.publish(self.make_motion_msg(info))
+            else:
+                await self.cube.api.sensor.request_motion_information()
         except Exception as e:
             self.get_logger().warn(f'motion state not read: {e}')
 
@@ -1157,6 +1235,7 @@ class ToioNode(Node):
 
         # battery_level is a percentage notified in 10% steps (0-100):
         # https://toio.github.io/toio-spec/docs/ble_battery
+        self._battery_level = int(info.battery_level)
         battery_state_msg = BatteryState()
         battery_state_msg.header.stamp = self.get_clock().now().to_msg()
         battery_state_msg.percentage = float(info.battery_level) / 100.0
@@ -1245,6 +1324,7 @@ class ToioNode(Node):
                 if cube_info is None:
                     raise RuntimeError('no toio cube found by BLE scan')
                 self.cube = ToioCoreCube(interface=cube_info.interface, name=cube_info.name)
+                self._cube_name = f'{cube_info.name} ({cube_info.device.address})'
                 # connect() may wait forever on a silent BLE failure
                 await asyncio.wait_for(self.cube.connect(), timeout=self.connect_timeout)
                 # cube.api is created inside connect(), so register handlers here;
