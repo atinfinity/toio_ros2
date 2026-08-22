@@ -116,8 +116,9 @@ def make_connectable_cube():
     cube = MagicMock()
     cube.connect = AsyncMock()
     for api in (cube.api.id_information, cube.api.battery, cube.api.motor,
-                cube.api.sensor):
+                cube.api.sensor, cube.api.button):
         api.register_notification_handler = AsyncMock()
+    cube.api.button.read = AsyncMock(return_value=None)
     cube.api.configuration._write = AsyncMock()
     cube.api.configuration.set_horizontal_detection_threshold = AsyncMock()
     cube.api.configuration.set_motor_speed_information_acquisition = AsyncMock()
@@ -369,6 +370,7 @@ def make_connected_cube_mock():
     cube.api.battery.unregister_notification_handler = AsyncMock()
     cube.api.motor.unregister_notification_handler = AsyncMock()
     cube.api.sensor.unregister_notification_handler = AsyncMock()
+    cube.api.button.unregister_notification_handler = AsyncMock()
     cube.disconnect = AsyncMock()
     return cube
 
@@ -662,6 +664,78 @@ def test_connect_survives_motion_setup_failure(node, monkeypatch):
 
     assert node.is_connected
     node.motion_pub.publish.assert_not_called()
+
+
+def make_button_payload(pressed):
+    # https://toio.github.io/toio-spec/en/docs/ble_button#read-operations
+    return bytearray(struct.pack('<BB', 0x01, 0x80 if pressed else 0x00))
+
+
+def test_button_notification_publishes_state(node):
+    node.button_pub = MagicMock()
+    node._on_button_notification(make_button_payload(True))
+    node.button_pub.publish.assert_called_once_with(Bool(data=True))
+    assert node._button_pressed
+    node._on_button_notification(make_button_payload(False))
+    assert node.button_pub.publish.call_args[0][0] == Bool(data=False)
+    assert not node._button_pressed
+
+
+def test_button_topic_is_latched(node):
+    assert node.button_pub.qos_profile.durability == DurabilityPolicy.TRANSIENT_LOCAL
+
+
+def test_button_stops_the_motor_only_when_enabled(node):
+    node.is_connected = True
+    msg = Twist()
+    msg.linear.x = 0.1
+    node.cmd_vel_callback(msg)
+    drive = node._latest_cmd_vel
+
+    node._on_button_notification(make_button_payload(True))
+    assert node.pending_motor_cmd() == drive  # default: the button is just reported
+
+    node.set_parameters([Parameter('stop_on_button', Parameter.Type.BOOL, True)])
+    assert node.pending_motor_cmd() == (0, 0)
+    assert node._latest_cmd_vel == drive  # kept, so releasing resumes
+
+    node._on_button_notification(make_button_payload(False))
+    assert node.pending_motor_cmd() == drive
+
+
+def test_connect_reads_the_button_state(node, monkeypatch):
+    node.button_pub = MagicMock()
+    cube = make_connectable_cube()
+    from toio.cube.api.button import ButtonInformation
+    cube.api.button.read = AsyncMock(return_value=ButtonInformation(make_button_payload(True)))
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.ToioCoreCube', lambda **kwargs: cube)
+    monkeypatch.setattr(
+        ToioNode, 'scan_toio',
+        AsyncMock(return_value=make_cube_info('toio Core Cube-C7f', 'AA:BB')))
+
+    asyncio.run(REAL_CONNECT_TOIO(node))
+
+    cube.api.button.register_notification_handler.assert_awaited_once_with(
+        node._on_button_notification)
+    node.button_pub.publish.assert_called_once_with(Bool(data=True))
+    assert node._button_pressed
+
+
+def test_connect_assumes_released_if_the_button_read_fails(node, monkeypatch):
+    node.button_pub = MagicMock()
+    node._button_pressed = True
+    cube = make_connectable_cube()
+    cube.api.button.read = AsyncMock(side_effect=RuntimeError('ble'))
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.ToioCoreCube', lambda **kwargs: cube)
+    monkeypatch.setattr(
+        ToioNode, 'scan_toio',
+        AsyncMock(return_value=make_cube_info('toio Core Cube-C7f', 'AA:BB')))
+
+    asyncio.run(REAL_CONNECT_TOIO(node))
+
+    assert node.is_connected
+    assert not node._button_pressed
+    node.button_pub.publish.assert_called_once_with(Bool(data=False))
 
 
 def make_motor_speed_payload(left, right):
