@@ -121,6 +121,7 @@ def make_connectable_cube():
     cube.api.configuration._write = AsyncMock()
     cube.api.configuration.set_horizontal_detection_threshold = AsyncMock()
     cube.api.configuration.set_motor_speed_information_acquisition = AsyncMock()
+    cube.api.configuration.set_posture_angle_detection = AsyncMock()
     cube.api.sensor.read = AsyncMock(return_value=None)
     return cube
 
@@ -576,12 +577,49 @@ def test_motion_frame_uses_frame_prefix(node):
 
 def test_other_sensor_notifications_are_not_published(node):
     node.motion_pub = MagicMock()
+    node.imu_pub = MagicMock()
     # posture angle (Euler) shares the sensor characteristic
     # https://toio.github.io/toio-spec/en/docs/ble_high_precision_tilt_sensor
     node._on_sensor_notification(bytearray(struct.pack('<BBhhh', 0x03, 0x01, 0, 0, 0)))
     # magnetic sensor
     node._on_sensor_notification(bytearray(struct.pack('<BBBbbb', 0x02, 0, 0, 0, 0, 0)))
     node.motion_pub.publish.assert_not_called()
+    node.imu_pub.publish.assert_not_called()
+
+
+def make_posture_quaternion_payload(w, x, y, z):
+    # https://toio.github.io/toio-spec/en/docs/ble_high_precision_tilt_sensor#obtaining-posture-angle-information-notifications-in-quaternions
+    return bytearray(struct.pack('<BBffff', 0x03, 0x02, w, x, y, z))
+
+
+def test_posture_quaternion_is_published_as_imu_in_rep103(node):
+    node.imu_pub = MagicMock()
+    node.frame_prefix = 'toio1/'
+    # nose up by 40deg is +pitch for the cube (x forward, y right, z down)
+    from tf_transformations import quaternion_from_euler
+    qx, qy, qz, qw = quaternion_from_euler(0.0, math.radians(40.0), 0.0)
+
+    node._on_sensor_notification(make_posture_quaternion_payload(qw, qx, qy, qz))
+
+    node.imu_pub.publish.assert_called_once()
+    msg = node.imu_pub.publish.call_args[0][0]
+    assert msg.header.frame_id == 'toio1/center'
+    o = msg.orientation
+    roll, pitch, yaw = euler_from_quaternion([o.x, o.y, o.z, o.w])
+    # and -pitch in REP-103 (x forward, y left, z up)
+    assert math.degrees(pitch) == pytest.approx(-40.0, abs=1e-3)
+    assert math.degrees(roll) == pytest.approx(0.0, abs=1e-3)
+    assert math.degrees(yaw) == pytest.approx(0.0, abs=1e-3)
+    assert msg.angular_velocity_covariance[0] == -1.0
+    assert msg.linear_acceleration_covariance[0] == -1.0
+    assert msg.orientation_covariance[8] > msg.orientation_covariance[0]
+
+
+def test_posture_quaternion_ignored_when_imu_disabled(node):
+    node.imu_pub = MagicMock()
+    node.imu_interval_ms = 0
+    node._on_sensor_notification(make_posture_quaternion_payload(1.0, 0.0, 0.0, 0.0))
+    node.imu_pub.publish.assert_not_called()
 
 
 def test_connect_applies_thresholds_and_reads_motion(node, monkeypatch):
@@ -757,9 +795,14 @@ def test_connect_enables_motor_speed_notification(node, monkeypatch):
 
     asyncio.run(REAL_CONNECT_TOIO(node))
 
-    from toio.cube.api.configuration import MotorSpeedInformationAcquisitionState
+    from toio.cube.api.configuration import (MotorSpeedInformationAcquisitionState,
+                                             PostureAngleDetectionCondition,
+                                             PostureAngleDetectionType)
     cube.api.configuration.set_motor_speed_information_acquisition.assert_awaited_once_with(
         MotorSpeedInformationAcquisitionState.Enable)
+    cube.api.configuration.set_posture_angle_detection.assert_awaited_once_with(
+        PostureAngleDetectionType.Quaternions, node.imu_interval_ms,
+        PostureAngleDetectionCondition.Always)
 
 
 def test_reconnect_clears_the_wheel_speed(node, scheduled):
