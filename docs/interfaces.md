@@ -62,6 +62,15 @@ result before doing anything else. It therefore stays available regardless of
 Default is a param for A4 mat. 
 Please see <https://toio.github.io/toio-spec/docs/hardware_position_id> in detail.
 
+![](../image/field_params.svg)
+
+`field_min_*` / `field_max_*` are the Position ID range of the mat area used as
+the field, and `field_width_meter` / `field_height_meter` its physical size. The
+`map` frame has its origin at `(field_min_x, field_min_y)` with `x` pointing
+along Position ID x and `y` pointing up (opposite to Position ID y, which grows
+downward on the mat). A `goal_pose` / `dock_to_pose` target is clamped to stay
+`goal_boundary_margin` Position ID units inside the field.
+
 |name|Type|Default|Description|
 |:---|:---|:---|:---|
 |field_min_x|double|98.0|minimum of `x` in field|
