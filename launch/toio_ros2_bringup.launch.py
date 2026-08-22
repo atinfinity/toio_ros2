@@ -21,6 +21,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -34,6 +35,10 @@ def generate_launch_description():
     namespace = LaunchConfiguration('namespace')
     cube_id = LaunchConfiguration('cube_id')
     frame_prefix = LaunchConfiguration('frame_prefix')
+    enable_goal_pose_motion = LaunchConfiguration('enable_goal_pose_motion')
+    publish_odom = LaunchConfiguration('publish_odom')
+    stop_on_position_id_missed = LaunchConfiguration('stop_on_position_id_missed')
+    stop_on_button = LaunchConfiguration('stop_on_button')
 
     declare_params_file_cmd = DeclareLaunchArgument(
         'params_file',
@@ -55,6 +60,31 @@ def generate_launch_description():
         name='frame_prefix',
         default_value='',
         description='TF frame prefix of this cube (e.g. "toio1/")')
+    # Node parameters that a deployment switches per launch (issue #55).
+    # An undeclared launch argument is silently ignored by launch, so the
+    # ones worth flipping from the command line are declared here with the
+    # node's own defaults. They are passed to the node after params_file and
+    # therefore override a value set in that file.
+    declare_enable_goal_pose_motion_cmd = DeclareLaunchArgument(
+        name='enable_goal_pose_motion',
+        default_value='true',
+        description='Subscribe goal_pose for the cube built-in target motion. '
+                    'Set to false when Nav2 / Open-RMF owns the motion plan '
+                    '(RViz "2D Goal Pose" publishes goal_pose too)')
+    declare_publish_odom_cmd = DeclareLaunchArgument(
+        name='publish_odom',
+        default_value='true',
+        description='Publish /odom and the map -> odom -> center TF tree from the '
+                    'wheel odometry; false publishes map -> center directly')
+    declare_stop_on_position_id_missed_cmd = DeclareLaunchArgument(
+        name='stop_on_position_id_missed',
+        default_value='true',
+        description='Stop the motor instead of following cmd_vel while the '
+                    'Position ID is missed')
+    declare_stop_on_button_cmd = DeclareLaunchArgument(
+        name='stop_on_button',
+        default_value='false',
+        description='Use the cube button as a hold-to-stop for cmd_vel')
 
     toio_ros2_node = Node(
         package='toio_ros2',
@@ -63,7 +93,16 @@ def generate_launch_description():
         namespace=namespace,
         parameters=[
             params_file,
-            {'cube_id': cube_id, 'frame_prefix': frame_prefix}],
+            {'cube_id': cube_id,
+             'frame_prefix': frame_prefix,
+             # launch configurations are strings; the node declares these
+             # as bool, so convert or the parameter type check fails
+             'enable_goal_pose_motion':
+                 ParameterValue(enable_goal_pose_motion, value_type=bool),
+             'publish_odom': ParameterValue(publish_odom, value_type=bool),
+             'stop_on_position_id_missed':
+                 ParameterValue(stop_on_position_id_missed, value_type=bool),
+             'stop_on_button': ParameterValue(stop_on_button, value_type=bool)}],
         output='screen')
 
     toio_description_node = IncludeLaunchDescription(
@@ -90,6 +129,10 @@ def generate_launch_description():
     ld.add_action(declare_namespace_cmd)
     ld.add_action(declare_cube_id_cmd)
     ld.add_action(declare_frame_prefix_cmd)
+    ld.add_action(declare_enable_goal_pose_motion_cmd)
+    ld.add_action(declare_publish_odom_cmd)
+    ld.add_action(declare_stop_on_position_id_missed_cmd)
+    ld.add_action(declare_stop_on_button_cmd)
 
     ld.add_action(toio_ros2_node)
     ld.add_action(toio_description_node)

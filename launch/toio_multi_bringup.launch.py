@@ -24,6 +24,16 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+# Node parameters forwarded to every per-robot toio_ros2_bringup include,
+# with the defaults of that launch file (and of the node)
+NODE_PARAM_ARGS = {
+    'enable_goal_pose_motion': 'true',
+    'publish_odom': 'true',
+    'stop_on_position_id_missed': 'true',
+    'stop_on_button': 'false',
+}
+
+
 def bringup_robots(context):
     """
     Create one bringup include per robot listed in the robots argument.
@@ -68,6 +78,9 @@ def bringup_robots(context):
                         'params_file':
                             context.launch_configurations['params_file'],
                         'use_rviz': 'false',
+                        # node parameters shared by every cube (issue #55)
+                        **{name: context.launch_configurations[name]
+                           for name in NODE_PARAM_ARGS},
                     }.items()
                 ),
             ]))
@@ -124,6 +137,11 @@ def generate_launch_description():
     ld.add_action(declare_cube_ids_cmd)
     ld.add_action(declare_cube1_id_cmd)
     ld.add_action(declare_cube2_id_cmd)
+    for name, default in NODE_PARAM_ARGS.items():
+        ld.add_action(DeclareLaunchArgument(
+            name=name, default_value=default,
+            description=f'{name} of every toio_ros2_node '
+                        '(see toio_ros2_bringup.launch.py)'))
 
     ld.add_action(OpaqueFunction(function=bringup_robots))
     ld.add_action(rviz2_node)

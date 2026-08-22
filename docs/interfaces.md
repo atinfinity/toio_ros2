@@ -128,6 +128,30 @@ downward on the mat). A `goal_pose` / `dock_to_pose` target is clamped to stay
 |led_duration_ms|int|0|lighting time of `/toio/led`. 0 keeps the indicator lit until the next command, 10-2550 lets the cube turn it off on its own (a fraction below 10ms is truncated, anything above 2550ms is clipped)|
 |sound_volume|int|255|volume of `/toio/sound`. Per the [toio spec](https://toio.github.io/toio-spec/docs/ble_sound) this is mute or full volume only: 0 is mute and every other value is the maximum volume|
 
+### Launch arguments
+
+Launch ignores an argument it does not declare, so `ros2 launch ... foo:=bar`
+with an undeclared `foo` silently does nothing. `toio_ros2_bringup.launch.py`
+declares the parameters a deployment switches per launch, with the node's
+defaults:
+
+```bash
+ros2 launch toio_ros2 toio_ros2_bringup.launch.py enable_goal_pose_motion:=false use_rviz:=false
+```
+
+|launch argument|Default|
+|:---|:---|
+|enable_goal_pose_motion|true|
+|publish_odom|true|
+|stop_on_position_id_missed|true|
+|stop_on_button|false|
+
+They are applied after `params_file`, so they override the same key in that
+file. Every other parameter (`cube_id` and `frame_prefix` aside, which have
+their own arguments) is set through `params_file`.
+`toio_multi_bringup.launch.py` accepts the same four and applies them to every
+cube.
+
 Parameter files is stored in [params](../params).
 And, [launch/toio_ros2_bringup.launch.py](../launch/toio_ros2_bringup.launch.py) load [params/toio_a4_play_mat_params.yaml](../params/toio_a4_play_mat_params.yaml) as default.
 Parameter files use the `/**/toio_ros2_node:` wildcard key so that they apply to the node in any namespace — both the plain single-cube launch and the per-robot namespaces (`/toio1`, `/toio2`, ...) of `toio_multi_bringup.launch.py`. A bare `toio_ros2_node:` key would only match the root namespace and be silently ignored by the namespaced nodes.
