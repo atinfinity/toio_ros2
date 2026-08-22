@@ -26,7 +26,8 @@ import pytest
 import rclpy
 from rclpy.action import CancelResponse, GoalResponse
 from rclpy.parameter import Parameter
-from std_msgs.msg import ColorRGBA, UInt8
+from rclpy.qos import DurabilityPolicy
+from std_msgs.msg import Bool, ColorRGBA, UInt8
 from tf_transformations import euler_from_quaternion
 from toio import MotorResponseCode, SoundId
 from toio.device_interface import CubeInfo
@@ -35,6 +36,9 @@ from toio_msgs.msg import Led, LedPattern, Melody
 from toio_msgs.msg import MidiNote as MidiNoteMsg
 
 from toio_ros2.toio_ros2_node import AUTO_CONNECT_SCAN_NUM, ToioNode
+
+# captured before the node fixture replaces it with a no-op
+REAL_CONNECT_TOIO = ToioNode.connect_toio
 
 SEND_INTERVALS = ['led_write_interval', 'sound_min_interval',
                   'motor_dedup_interval']
@@ -94,6 +98,11 @@ def scheduled(monkeypatch):
 def make_position_id_payload(x, y, angle):
     # https://toio.github.io/toio-spec/en/docs/ble_id#position-id
     return bytearray(struct.pack('<BHHHHHH', 0x01, x, y, angle, x, y, angle))
+
+
+def make_position_id_missed_payload():
+    # https://toio.github.io/toio-spec/en/docs/ble_id#position-id-missed
+    return bytearray(struct.pack('<B', 0x03))
 
 
 def test_convert_toio_to_ros_coord(node):
@@ -430,15 +439,97 @@ def test_position_id_notification_publishes_pose(node):
     assert transform.transform.translation.z == 0.0
 
 
-def test_position_id_missed_is_not_published(node):
+def test_position_id_missed_publishes_state_without_pose(node):
     node.toio_pose_pub = MagicMock()
     node.tf_broadcaster = MagicMock()
+    node.position_id_missed_pub = MagicMock()
 
-    # https://toio.github.io/toio-spec/en/docs/ble_id#position-id-missed
-    node._on_id_notification(bytearray(struct.pack('<B', 0x03)))
+    node._on_id_notification(make_position_id_missed_payload())
 
     node.toio_pose_pub.publish.assert_not_called()
     node.tf_broadcaster.sendTransform.assert_not_called()
+    node.position_id_missed_pub.publish.assert_called_once_with(Bool(data=True))
+    assert node._position_id_missed
+
+
+def test_position_id_missed_is_published_on_change_only(node):
+    node.toio_pose_pub = MagicMock()
+    node.tf_broadcaster = MagicMock()
+    node.position_id_missed_pub = MagicMock()
+
+    # on the mat at startup: a Position ID does not announce anything
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+    node.position_id_missed_pub.publish.assert_not_called()
+
+    node._on_id_notification(make_position_id_missed_payload())
+    node._on_id_notification(make_position_id_missed_payload())
+    assert node.position_id_missed_pub.publish.call_count == 1
+
+    # back on the mat: recovery is announced and the pose flows again
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+    assert node.position_id_missed_pub.publish.call_count == 2
+    assert node.position_id_missed_pub.publish.call_args[0][0] == Bool(data=False)
+    assert not node._position_id_missed
+    assert node.toio_pose_pub.publish.call_count == 2
+
+
+def test_position_id_missed_topic_is_latched(node):
+    qos = node.position_id_missed_pub.qos_profile
+    assert qos.durability == DurabilityPolicy.TRANSIENT_LOCAL
+
+
+def test_position_id_missed_stops_the_motor(node):
+    node.is_connected = True
+    msg = Twist()
+    msg.linear.x = 0.1
+    node.cmd_vel_callback(msg)
+    drive = node._latest_cmd_vel
+    assert drive != (0, 0)
+
+    node._on_id_notification(make_position_id_missed_payload())
+    assert node.pending_motor_cmd() == (0, 0)
+    # the newest cmd_vel is kept, not dropped, for when the mat is read again
+    assert node._latest_cmd_vel == drive
+
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+    assert node.pending_motor_cmd() == drive
+
+
+def test_position_id_missed_stop_can_be_disabled(node):
+    node.is_connected = True
+    node.set_parameters([Parameter(
+        'stop_on_position_id_missed', Parameter.Type.BOOL, False)])
+    msg = Twist()
+    msg.linear.x = 0.1
+    node.cmd_vel_callback(msg)
+
+    node._on_id_notification(make_position_id_missed_payload())
+    assert node.pending_motor_cmd() == node._latest_cmd_vel
+
+
+@pytest.mark.parametrize('missed_before', [True, False])
+def test_position_id_missed_is_reset_on_connect(node, monkeypatch, missed_before):
+    node.position_id_missed_pub = MagicMock()
+    if missed_before:
+        node._on_id_notification(make_position_id_missed_payload())
+    node.position_id_missed_pub.publish.reset_mock()
+
+    cube = MagicMock()
+    cube.connect = AsyncMock()
+    for api in (cube.api.id_information, cube.api.battery, cube.api.motor):
+        api.register_notification_handler = AsyncMock()
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.ToioCoreCube', lambda **kwargs: cube)
+    monkeypatch.setattr(
+        ToioNode, 'scan_toio',
+        AsyncMock(return_value=make_cube_info('toio Core Cube-C7f', 'AA:BB')))
+
+    # the node fixture stubs out connect_toio, so call the real one
+    asyncio.run(REAL_CONNECT_TOIO(node))
+
+    assert node.is_connected
+    assert not node._position_id_missed
+    # published even when nothing changed, so the latched topic has a value
+    node.position_id_missed_pub.publish.assert_called_once_with(Bool(data=False))
 
 
 def test_toio_transform_uses_frame_prefix(node):

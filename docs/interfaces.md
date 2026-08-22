@@ -23,7 +23,8 @@ Topics, action servers and parameters of `toio_ros2_node`.
 
 |topic name|Type|Description|
 |:---|:---|:---|
-|/toio/pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|toio pose in map frame|
+|/toio/pose|[geometry_msgs/msg/PoseStamped](https://docs.ros2.org/foxy/api/geometry_msgs/msg/PoseStamped.html)|toio pose in map frame. Not published while the Position ID is missed (see `/toio/position_id_missed`)|
+|/toio/position_id_missed|[std_msgs/msg/Bool](https://docs.ros2.org/foxy/api/std_msgs/msg/Bool.html)|`true` while the cube cannot read the mat (lifted, driven off the edge, standing on the border), `false` once it reads a Position ID again. Published on change only with a `TRANSIENT_LOCAL` QoS, so a late subscriber still gets the current state. Reset to `false` on every (re)connection. See the [toio spec](https://toio.github.io/toio-spec/docs/ble_id#position-id-missed)|
 |/toio/battery_state|[sensor_msgs/msg/BatteryState](https://docs.ros2.org/foxy/api/sensor_msgs/msg/BatteryState.html)|battery level of toio (`percentage` is 0.0-1.0). The cube notifies it in 10% steps, see the [toio spec](https://toio.github.io/toio-spec/docs/ble_battery)|
 |/tf|-|a valid transform from `map` to `center`|
 
@@ -86,6 +87,7 @@ downward on the mat). A `goal_pose` / `dock_to_pose` target is clamped to stay
 |cube_id|string|''|connect only to the cube whose BLE local name contains `cube_id`|
 |cube_address|string|''|connect only to the cube with this BLE address|
 |frame_prefix|string|''|prefix of the TF child frame (`<frame_prefix>center`) for multi-cube setups|
+|stop_on_position_id_missed|bool|true|send a motor stop instead of `cmd_vel` while `/toio/position_id_missed` is `true`, so a cube that left the mat does not drive blind on the last pose Nav2 saw. The newest `cmd_vel` is kept and applied as soon as the mat is read again. `goal_pose` / `dock_to_pose` are unaffected: the cube's own target motion aborts with `Position ID missed` by itself|
 |enable_goal_pose_motion|bool|true|subscribe `goal_pose` and use the cube built-in target motion. Set to false when an external traffic authority (e.g. Open-RMF) owns the motion plan and all movement must go through Nav2 `cmd_vel`. Does not affect the `dock_to_pose` action|
 |led_duration_ms|int|0|lighting time of `/toio/led`. 0 keeps the indicator lit until the next command, 10-2550 lets the cube turn it off on its own (a fraction below 10ms is truncated, anything above 2550ms is clipped)|
 |sound_volume|int|255|volume of `/toio/sound`. Per the [toio spec](https://toio.github.io/toio-spec/docs/ble_sound) this is mute or full volume only: 0 is mute and every other value is the maximum volume|

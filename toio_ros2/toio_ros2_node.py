@@ -26,13 +26,15 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import BatteryState
-from std_msgs.msg import ColorRGBA, UInt8
+from std_msgs.msg import Bool, ColorRGBA, UInt8
 from tf2_ros import TransformBroadcaster
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 from toio import (Battery, BLEScanner, Color, CubeLocation, IdInformation,
                   IndicatorParam, MidiNote, Motor, MotorResponseCode,
-                  MovementType, Point, PositionId, ResponseMotorControlTarget,
+                  MovementType, Point, PositionId, PositionIdMissed,
+                  ResponseMotorControlTarget,
                   RotationOption, SoundId, Speed, SpeedChangeType,
                   TargetPosition, ToioCoreCube)
 from toio_msgs.msg import Led, LedPattern, Melody
@@ -126,6 +128,15 @@ class ToioNode(Node):
         # Latest published position, used for the dock action feedback
         self._last_pose_xy: tuple = None
 
+        # Whether the cube has lost the Position ID (issue #41): lifted off
+        # the mat, driven past its edge or standing on the border. The cube
+        # sends Position ID missed once when it happens and a normal Position
+        # ID notification as soon as it can read the mat again, so this flips
+        # on the first of each and the topic is published on the change only.
+        # Reset on every (re)connection because nothing is known about the
+        # cube while it is away.
+        self._position_id_missed = False
+
         # Default is a param for A4 mat https://toio.github.io/toio-spec/docs/hardware_position_id
         self.declare_parameter('field_min_x', 98.0)
         self.declare_parameter('field_max_x', 402.0)
@@ -168,6 +179,14 @@ class ToioNode(Node):
         # This does NOT disable the dock_to_pose action, which uses the same
         # built-in motion; see the comment where that server is created.
         self.declare_parameter('enable_goal_pose_motion', True)
+
+        # Stop the wheels while the Position ID is missed (issue #41). Nav2
+        # keeps publishing cmd_vel from the last pose it saw, which on a cube
+        # that has left the mat means driving blind across the table. The
+        # newest cmd_vel is still kept so the cube picks it up the moment it
+        # reads the mat again. goal_pose / dock_to_pose are not touched here:
+        # the cube's own target motion aborts with Position ID missed.
+        self.declare_parameter('stop_on_position_id_missed', True)
 
         # Visual / audible feedback (issue #28). led_duration_ms 0 keeps the
         # indicator lit until the next command; 10-2550 lets the cube turn it
@@ -221,6 +240,8 @@ class ToioNode(Node):
             'frame_prefix').get_parameter_value().string_value
         self.enable_goal_pose_motion = self.get_parameter(
             'enable_goal_pose_motion').get_parameter_value().bool_value
+        self.stop_on_position_id_missed = self.get_parameter(
+            'stop_on_position_id_missed').get_parameter_value().bool_value
         self.led_duration_ms = self.get_parameter(
             'led_duration_ms').get_parameter_value().integer_value
         self.sound_volume = self.get_parameter(
@@ -295,6 +316,12 @@ class ToioNode(Node):
         self.toio_pose_pub = self.create_publisher(PoseStamped, 'toio/pose', qos_profile=10)
         self.toio_battery_state_pub = self.create_publisher(
             BatteryState, 'toio/battery_state', qos_profile=10)
+        # A state, published on change only, so it is latched: a subscriber
+        # that starts while the cube is already off the mat must still learn
+        # about it, since the next message only comes when the state flips.
+        self.position_id_missed_pub = self.create_publisher(
+            Bool, 'toio/position_id_missed',
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         # Initialize the transform broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -697,6 +724,9 @@ class ToioNode(Node):
         for param in params:
             if param.name in self.SEND_INTERVAL_BOUNDS:
                 setattr(self, param.name, param.value)
+            elif param.name == 'stop_on_position_id_missed':
+                # pending_motor_cmd() reads this every tick
+                self.stop_on_position_id_missed = param.value
         return SetParametersResult(successful=True)
 
     @staticmethod
@@ -713,9 +743,13 @@ class ToioNode(Node):
     def _on_id_notification(self, payload: bytearray) -> None:
         """Handle Position ID notification (called on the asyncio loop thread)."""
         info = IdInformation.is_my_data(payload)
-        # PositionIdMissed (cube left the mat) and StandardId are not published
+        if isinstance(info, PositionIdMissed):
+            self.set_position_id_missed(True)
+            return
+        # StandardId / StandardIdMissed (toio collection cards) are not published
         if not isinstance(info, PositionId):
             return
+        self.set_position_id_missed(False)
 
         # convert ROS 2 coordinate
         pos_x, pos_y, q_x, q_y, q_z, q_w = self.convert_toio_to_ros_coord(
@@ -731,6 +765,17 @@ class ToioNode(Node):
         # send the transformation
         toio_transform = self.make_toio_transform(pos_x, pos_y, q_x, q_y, q_z, q_w)
         self.tf_broadcaster.sendTransform(toio_transform)
+
+    def set_position_id_missed(self, missed: bool) -> None:
+        """Update the Position ID missed state, publishing it when it changes."""
+        if missed == self._position_id_missed:
+            return
+        self._position_id_missed = missed
+        if missed:
+            self.get_logger().warn('Position ID missed: the cube cannot read the mat')
+        else:
+            self.get_logger().info('Position ID recovered')
+        self.position_id_missed_pub.publish(Bool(data=missed))
 
     def convert_toio_to_ros_coord(self, x, y, angle):
         pos_x = float(x - self.field_min_x) * self.scale_x
@@ -894,6 +939,13 @@ class ToioNode(Node):
                 # match the last requested color, so let led_command_loop()
                 # write it again (an identical write is harmless)
                 self._last_led_cmd = None
+                # The cube may have been moved while it was away, and a stale
+                # 'missed' would keep the wheels stopped until the first
+                # notification (which only comes when the state changes).
+                # Always published, not only on change, so the latched topic
+                # has a value from the first connection on.
+                self._position_id_missed = False
+                self.position_id_missed_pub.publish(Bool(data=False))
                 self.is_connected = True
                 self.get_logger().info(
                     f'toio is connected: {cube_info.name} ({cube_info.device.address})')
@@ -913,6 +965,11 @@ class ToioNode(Node):
         # would report SUCCESS_WITH_OVERWRITE).
         if self._docking:
             return None
+        # Off the mat there is no pose to drive by (see
+        # stop_on_position_id_missed). The stop is sent instead of skipping
+        # the tick so a cube that ran off the edge actually halts.
+        if self._position_id_missed and self.stop_on_position_id_missed:
+            return (0, 0)
         # Send stop when cmd_vel goes silent, keeping the auto-stop
         # semantics of duration_ms=500
         if time.monotonic() - self._latest_cmd_vel_stamp > self.cmd_vel_timeout:
