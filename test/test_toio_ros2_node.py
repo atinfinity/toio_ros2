@@ -120,6 +120,7 @@ def make_connectable_cube():
         api.register_notification_handler = AsyncMock()
     cube.api.configuration._write = AsyncMock()
     cube.api.configuration.set_horizontal_detection_threshold = AsyncMock()
+    cube.api.configuration.set_motor_speed_information_acquisition = AsyncMock()
     cube.api.sensor.read = AsyncMock(return_value=None)
     return cube
 
@@ -443,6 +444,7 @@ def test_destroy_node_cancels_pending_tasks_after_shutdown(node, monkeypatch):
 def test_position_id_notification_publishes_pose(node):
     node.toio_pose_pub = MagicMock()
     node.tf_broadcaster = MagicMock()
+    node.publish_odom = False  # legacy tree: map -> center straight from the Position ID
 
     node._on_id_notification(make_position_id_payload(250, 250, 0))
 
@@ -622,6 +624,149 @@ def test_connect_survives_motion_setup_failure(node, monkeypatch):
 
     assert node.is_connected
     node.motion_pub.publish.assert_not_called()
+
+
+def make_motor_speed_payload(left, right):
+    # https://toio.github.io/toio-spec/en/docs/ble_motor#obtaining-motor-speed-information
+    return bytearray(struct.pack('<BBB', 0xE0, left, right))
+
+
+def test_motor_speed_notification_is_stored(node):
+    node._on_motor_notification(make_motor_speed_payload(30, 40))
+    assert node._wheel_speed == (30, 40)
+
+
+def test_speed_to_mps_matches_the_cube_maximum(node):
+    v = node.speed_to_mps(int(node.max_input_speed))
+    assert v == pytest.approx(node.max_rpm / 60.0 * 2.0 * math.pi * node.wheel_radius)
+    assert node.speed_to_mps(0) == 0.0
+
+
+def test_wheel_velocities_take_the_sign_from_the_last_command(node):
+    # the cube reports magnitudes only, so the command decides the direction
+    node._wheel_speed = (30, 30)
+    node._wheel_dir = (-1, 1)
+    v_l, v_r = node.wheel_velocities()
+    assert v_l == pytest.approx(-node.speed_to_mps(30))
+    assert v_r == pytest.approx(node.speed_to_mps(30))
+
+
+def test_motor_control_remembers_the_direction_across_a_stop(node):
+    node.cube = MagicMock()
+    node.cube.api.motor.motor_control = AsyncMock()
+    asyncio.run(node.motor_control(-30, 30))
+    assert node._wheel_dir == (-1, 1)
+    # the wheels coast after a stop, so the reported speed keeps its sign
+    asyncio.run(node.motor_control(0, 0))
+    assert node._wheel_dir == (-1, 1)
+    asyncio.run(node.motor_control(30, 0))
+    assert node._wheel_dir == (1, 1)
+
+
+def test_integrate_odom_straight_line(node):
+    node._wheel_speed = (30, 30)
+    v, omega = node.integrate_odom(1.0)
+    assert v == pytest.approx(node.speed_to_mps(30))
+    assert omega == 0.0
+    x, y, yaw = node._odom_pose
+    assert x == pytest.approx(v)
+    assert y == 0.0
+    assert yaw == 0.0
+
+
+def test_integrate_odom_spin_in_place(node):
+    node._wheel_speed = (30, 30)
+    node._wheel_dir = (-1, 1)
+    v, omega = node.integrate_odom(0.1)
+    assert v == pytest.approx(0.0)
+    assert omega == pytest.approx(2.0 * node.speed_to_mps(30) / node.wheel_base)
+    x, y, yaw = node._odom_pose
+    assert (x, y) == (0.0, 0.0)
+    assert yaw == pytest.approx(omega * 0.1)
+
+
+def test_compose_map_to_odom_puts_the_odom_pose_on_the_map_pose():
+    # a point at (1, 0, 90deg) in odom and (0, 1, 180deg) in map: odom sits
+    # rotated by 90deg and the point itself rotates onto (0, 1)
+    x, y, yaw = ToioNode.compose_map_to_odom((0.0, 1.0, math.pi), (1.0, 0.0, math.pi / 2))
+    assert yaw == pytest.approx(math.pi / 2)
+    assert x == pytest.approx(0.0)
+    assert y == pytest.approx(0.0)
+    # and the identity case
+    assert ToioNode.compose_map_to_odom((0.3, 0.2, 0.1), (0.3, 0.2, 0.1)) == \
+        pytest.approx((0.0, 0.0, 0.0))
+
+
+def test_position_id_updates_map_to_odom_instead_of_the_transform(node):
+    node.toio_pose_pub = MagicMock()
+    node.tf_broadcaster = MagicMock()
+    node._odom_pose = (0.1, 0.0, 0.0)
+
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+
+    node.toio_pose_pub.publish.assert_called_once()
+    node.tf_broadcaster.sendTransform.assert_not_called()
+    msg = node.toio_pose_pub.publish.call_args[0][0]
+    x, y, yaw = node._map_to_odom
+    assert x == pytest.approx(msg.pose.position.x - 0.1)
+    assert y == pytest.approx(msg.pose.position.y)
+    assert yaw == pytest.approx(0.0)
+
+
+def test_odom_timer_publishes_odometry_and_both_transforms(node):
+    node.odom_pub = MagicMock()
+    node.tf_broadcaster = MagicMock()
+    node.frame_prefix = 'toio1/'
+    node.is_connected = True
+    node._wheel_speed = (30, 30)
+    node._map_to_odom = (0.2, 0.1, 0.0)
+
+    node.odom_timer_callback()  # first tick only takes the time
+    node.odom_pub.publish.assert_not_called()
+    node._last_odom_time -= rclpy.duration.Duration(seconds=0.5)
+    node.odom_timer_callback()
+
+    odom = node.odom_pub.publish.call_args[0][0]
+    assert odom.header.frame_id == 'toio1/odom'
+    assert odom.child_frame_id == 'toio1/center'
+    assert odom.twist.twist.linear.x == pytest.approx(node.speed_to_mps(30))
+    assert odom.pose.pose.position.x == pytest.approx(node.speed_to_mps(30) * 0.5, rel=0.05)
+    transforms = node.tf_broadcaster.sendTransform.call_args[0][0]
+    assert [(t.header.frame_id, t.child_frame_id) for t in transforms] == [
+        ('map', 'toio1/odom'), ('toio1/odom', 'toio1/center')]
+    assert transforms[0].transform.translation.x == pytest.approx(0.2)
+    assert transforms[0].header.stamp == transforms[1].header.stamp == odom.header.stamp
+
+
+def test_odom_timer_does_nothing_while_disconnected(node):
+    node.odom_pub = MagicMock()
+    node.tf_broadcaster = MagicMock()
+    node._last_odom_time = node.get_clock().now()
+    node.odom_timer_callback()
+    node.odom_pub.publish.assert_not_called()
+    # the gap is not motion: the next connected tick restarts the clock
+    assert node._last_odom_time is None
+
+
+def test_connect_enables_motor_speed_notification(node, monkeypatch):
+    cube = make_connectable_cube()
+    monkeypatch.setattr('toio_ros2.toio_ros2_node.ToioCoreCube', lambda **kwargs: cube)
+    monkeypatch.setattr(
+        ToioNode, 'scan_toio',
+        AsyncMock(return_value=make_cube_info('toio Core Cube-C7f', 'AA:BB')))
+
+    asyncio.run(REAL_CONNECT_TOIO(node))
+
+    from toio.cube.api.configuration import MotorSpeedInformationAcquisitionState
+    cube.api.configuration.set_motor_speed_information_acquisition.assert_awaited_once_with(
+        MotorSpeedInformationAcquisitionState.Enable)
+
+
+def test_reconnect_clears_the_wheel_speed(node, scheduled):
+    node.is_connected = True
+    node._wheel_speed = (30, 30)
+    node._schedule_reconnect()
+    assert node._wheel_speed == (0, 0)
 
 
 def test_toio_transform_uses_frame_prefix(node):

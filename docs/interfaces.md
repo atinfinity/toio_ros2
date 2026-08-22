@@ -27,7 +27,8 @@ Topics, action servers and parameters of `toio_ros2_node`.
 |/toio/position_id_missed|[std_msgs/msg/Bool](https://docs.ros2.org/foxy/api/std_msgs/msg/Bool.html)|`true` while the cube cannot read the mat (lifted, driven off the edge, standing on the border), `false` once it reads a Position ID again. Published on change only with a `TRANSIENT_LOCAL` QoS, so a late subscriber still gets the current state. Reset to `false` on every (re)connection. See the [toio spec](https://toio.github.io/toio-spec/docs/ble_id#position-id-missed)|
 |/toio/battery_state|[sensor_msgs/msg/BatteryState](https://docs.ros2.org/foxy/api/sensor_msgs/msg/BatteryState.html)|battery level of toio (`percentage` is 0.0-1.0). The cube notifies it in 10% steps, see the [toio spec](https://toio.github.io/toio-spec/docs/ble_battery)|
 |/toio/motion|[toio_msgs/msg/MotionDetection](https://github.com/atinfinity/toio_msgs)|motion detection: `horizontal`, `collision`, `double_tap`, `posture` and `shake`. Published when the cube reports a change, plus once on every (re)connection. `collision` and `double_tap` are momentary (`true` in the notification that detects them, `false` in the next), so treat them as events. See the [toio spec](https://toio.github.io/toio-spec/docs/ble_sensor)|
-|/tf|-|a valid transform from `map` to `center`|
+|/odom|[nav_msgs/msg/Odometry](https://docs.ros2.org/foxy/api/nav_msgs/msg/Odometry.html)|wheel odometry at 20Hz (`odom` → `center`), only when `publish_odom` is true. The twist is the cube's reported wheel speeds, the pose their integration. See [Odometry](#odometry)|
+|/tf|-|`map` → `center`. With `publish_odom` (default) this goes through `odom`: `map` → `odom` is corrected from the Position ID and held while it is missed, `odom` → `center` is the wheel odometry. With `publish_odom: false` the node publishes `map` → `center` straight from the Position ID|
 
 ## Action servers
 
@@ -58,6 +59,31 @@ it inverts all three properties - the traffic authority issues it itself, at a
 waypoint it has already reserved, over a few centimetres, and it waits for the
 result before doing anything else. It therefore stays available regardless of
 `enable_goal_pose_motion`.
+
+## Odometry
+
+With `publish_odom` (the default) the node enables the cube's
+[motor speed notification](https://toio.github.io/toio-spec/docs/ble_motor#モーターの速度情報の取得)
+and dead-reckons a pose from it:
+
+- `odom` → `center` and `/odom` are the integrated wheel speeds, published at 20Hz.
+- `map` → `odom` is recomputed on every Position ID so that `map` → `center`
+  matches the mat reading, and held while the Position ID is missed. The
+  cube's pose therefore keeps moving from the wheel odometry over a gap in the
+  mat reading instead of freezing.
+- `/toio/pose` is still the raw Position ID in `map`, unchanged.
+
+The cube reports the wheel speeds as **magnitudes only** (verified on a real
+cube: reverse and spin-in-place both come back positive), so the node takes
+the direction from the last motor command it sent. During a built-in target
+motion (`goal_pose`, `dock_to_pose`) the cube drives itself and the direction
+is a guess from the last `cmd_vel`; those motions are mostly forward, so a
+stale reverse command before one is what misleads the odometry until the next
+Position ID corrects it. The speeds also arrive only when they change (every
+100ms at most), so the integration holds the last reported value in between.
+
+Set `publish_odom: false` to get the previous TF tree (`map` → `center`
+directly, no `odom` frame, no `/odom`).
 
 ## Parameters
 
@@ -91,6 +117,7 @@ downward on the mat). A `goal_pose` / `dock_to_pose` target is clamped to stay
 |stop_on_position_id_missed|bool|true|send a motor stop instead of `cmd_vel` while `/toio/position_id_missed` is `true`, so a cube that left the mat does not drive blind on the last pose Nav2 saw. The newest `cmd_vel` is kept and applied as soon as the mat is read again. `goal_pose` / `dock_to_pose` are unaffected: the cube's own target motion aborts with `Position ID missed` by itself|
 |collision_threshold|int|7|collision detection sensitivity sent to the cube on every (re)connection, 1 (most sensitive) to 10. The cube default of 7 needs a fairly hard knock; lower it when `/toio/motion` is used to detect a bump against a wall at navigation speeds|
 |horizontal_threshold|int|45|tilt in degrees beyond which `horizontal` in `/toio/motion` turns `false`, 1-45, sent to the cube on every (re)connection. The cube default of 45 only catches a cube nearly on its side; lower it to detect climbing onto another cube or a mat edge|
+|publish_odom|bool|true|publish `/odom` and the `map` → `odom` → `center` TF tree from the cube's wheel speed notification. Set to false for the plain `map` → `center` transform|
 |enable_goal_pose_motion|bool|true|subscribe `goal_pose` and use the cube built-in target motion. Set to false when an external traffic authority (e.g. Open-RMF) owns the motion plan and all movement must go through Nav2 `cmd_vel`. Does not affect the `dock_to_pose` action|
 |led_duration_ms|int|0|lighting time of `/toio/led`. 0 keeps the indicator lit until the next command, 10-2550 lets the cube turn it off on its own (a fraction below 10ms is truncated, anything above 2550ms is clipped)|
 |sound_volume|int|255|volume of `/toio/sound`. Per the [toio spec](https://toio.github.io/toio-spec/docs/ble_sound) this is mute or full volume only: 0 is mute and every other value is the maximum volume|

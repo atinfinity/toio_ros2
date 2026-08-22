@@ -13,6 +13,7 @@
   <depend>geometry_msgs</depend>
   <!-- NavigateToPose, reused as the dock_to_pose action type -->
   <depend>nav2_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>tf_transformations</depend>
   <depend>toio_description</depend>
