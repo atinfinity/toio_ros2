@@ -215,13 +215,15 @@ class ToioNode(Node):
         self.declare_parameter('frame_prefix', '')
 
         # The cube's built-in target motion (goal_pose topic) moves the cube
-        # on a path that no external planner knows about. Disable it when an
-        # external traffic authority (e.g. Open-RMF) owns the motion plan and
-        # all movement must go through Nav2 cmd_vel instead.
+        # on a path that no external planner knows about, and RViz's
+        # "2D Goal Pose" tool publishes goal_pose too, so with Nav2 or
+        # Open-RMF in the loop it would fight their cmd_vel. Off by default;
+        # switch it on for the standalone bringup to drive the cube from RViz
+        # without Nav2.
         #
         # This does NOT disable the dock_to_pose action, which uses the same
         # built-in motion; see the comment where that server is created.
-        self.declare_parameter('enable_goal_pose_motion', True)
+        self.declare_parameter('enable_goal_pose_motion', False)
 
         # Stop the wheels while the Position ID is missed (issue #41). Nav2
         # keeps publishing cmd_vel from the last pose it saw, which on a cube

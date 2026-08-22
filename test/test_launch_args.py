@@ -24,7 +24,7 @@ LAUNCH_DIR = os.path.join(os.path.dirname(__file__), '..', 'launch')
 
 # name -> default, matching the defaults declared by toio_ros2_node
 NODE_PARAM_ARGS = {
-    'enable_goal_pose_motion': 'true',
+    'enable_goal_pose_motion': 'false',
     'publish_odom': 'true',
     'stop_on_position_id_missed': 'true',
     'stop_on_button': 'false',
