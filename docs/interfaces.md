@@ -115,6 +115,7 @@ downward on the mat). A `goal_pose` / `dock_to_pose` target is clamped to stay
 |goal_timeout|int|60|timeout(second) for a `goal_pose` motion|
 |dock_timeout|int|10|timeout(second) for a `dock_to_pose` motion. Much shorter than `goal_timeout` because a dock covers a few centimetres: a cube that cannot reach the target, because something is standing on it, must give up quickly instead of pushing for a minute|
 |goal_boundary_margin|int|10|margin(Position ID units) kept between a clamped goal and the mat boundary|
+|pose_outlier_max_jump|double|0.05|largest move(meter) between two Position ID samples taken at face value. A sample further than this from the last accepted one is held back and published only if the next sample confirms it (the cube was really moved); a single far-off read is dropped. Samples outside the mat field are always dropped. `0` disables the guard|
 |cube_id|string|''|connect only to the cube whose BLE local name contains `cube_id`|
 |cube_address|string|''|connect only to the cube with this BLE address|
 |frame_prefix|string|''|prefix of the TF child frame (`<frame_prefix>center`) for multi-cube setups|
