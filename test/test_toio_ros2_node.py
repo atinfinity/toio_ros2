@@ -1601,3 +1601,71 @@ def test_connect_requests_motion_when_the_read_returns_something_else(node, monk
 
     cube.api.sensor.request_motion_information.assert_awaited_once()
     node.motion_pub.publish.assert_not_called()
+
+
+def _pose_publisher(node):
+    node.toio_pose_pub = MagicMock()
+    node.tf_broadcaster = MagicMock()
+    node.publish_odom = False
+    return node.toio_pose_pub.publish
+
+
+def test_pose_outside_the_field_is_dropped(node):
+    publish = _pose_publisher(node)
+
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+    # beyond field_max_x (402) + tolerance: impossible on this mat (issue #59)
+    node._on_id_notification(make_position_id_payload(450, 250, 0))
+
+    assert publish.call_count == 1
+
+
+def test_single_jump_sample_is_held_back(node):
+    publish = _pose_publisher(node)
+
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+    # ~150 mm away for one sample, then back: a read glitch
+    node._on_id_notification(make_position_id_payload(400, 250, 0))
+    node._on_id_notification(make_position_id_payload(251, 250, 0))
+
+    assert publish.call_count == 2
+    xs = [c[0][0].pose.position.x for c in publish.call_args_list]
+    assert max(xs) < (300 - node.field_min_x) * node.scale_x
+
+
+def test_confirmed_jump_is_published(node):
+    publish = _pose_publisher(node)
+
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+    # the cube was picked up and put down 150 mm away: the second sample at
+    # the new place confirms the move
+    node._on_id_notification(make_position_id_payload(400, 250, 0))
+    node._on_id_notification(make_position_id_payload(401, 250, 0))
+    node._on_id_notification(make_position_id_payload(401, 251, 0))
+
+    assert publish.call_count == 3
+    assert publish.call_args[0][0].pose.position.x == pytest.approx(
+        (401 - node.field_min_x) * node.scale_x)
+
+
+def test_first_sample_after_position_id_missed_is_trusted(node):
+    publish = _pose_publisher(node)
+    node.position_id_missed_pub = MagicMock()
+
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+    node._on_id_notification(make_position_id_missed_payload())
+    # put back far from where it was lifted
+    node._on_id_notification(make_position_id_payload(120, 160, 0))
+
+    assert publish.call_count == 2
+
+
+def test_outlier_guard_can_be_disabled(node):
+    publish = _pose_publisher(node)
+    node.pose_outlier_max_jump = 0.0
+
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+    node._on_id_notification(make_position_id_payload(400, 250, 0))
+    node._on_id_notification(make_position_id_payload(250, 250, 0))
+
+    assert publish.call_count == 3

@@ -142,6 +142,13 @@ class ToioNode(Node):
         self._dock_started_at: float = 0.0
         # Latest published position, used for the dock action feedback
         self._last_pose_xy: tuple = None
+        # Outlier guard for the Position ID (issue #59): the cube now and
+        # then reports a single sample far off (~185 mm, even outside the
+        # mat) that the next sample undoes. The last accepted sample and the
+        # one candidate held back are kept here; see _is_pose_outlier().
+        self._last_accepted_xy: tuple = None
+        self._last_accepted_at: float = 0.0
+        self._held_back_xy: tuple = None
 
         # Whether the cube has lost the Position ID (issue #41): lifted off
         # the mat, driven past its edge or standing on the border. The cube
@@ -199,6 +206,13 @@ class ToioNode(Node):
         # Margin (in Position ID units) kept between a clamped goal and the
         # mat boundary so the cube's ID sensor stays in the readable area
         self.declare_parameter('goal_boundary_margin', 10)
+        # Largest move [m] between two Position ID samples that is taken at
+        # face value (issue #59). A sample further than this from the last
+        # accepted one is held back; it is published only if the next sample
+        # agrees with it (the cube was really moved, e.g. by hand), otherwise
+        # it is dropped as a read glitch. Samples outside the mat field are
+        # always dropped. 0 disables the guard.
+        self.declare_parameter('pose_outlier_max_jump', 0.05)
 
         # Cube identification (issue #14). Both empty (default): connect to
         # the nearest cube found by the scan. cube_id is matched as a substring
@@ -296,6 +310,8 @@ class ToioNode(Node):
         self.field_max_x = self.get_parameter('field_max_x').get_parameter_value().double_value
         self.field_min_y = self.get_parameter('field_min_y').get_parameter_value().double_value
         self.field_max_y = self.get_parameter('field_max_y').get_parameter_value().double_value
+        self.pose_outlier_max_jump = self.get_parameter(
+            'pose_outlier_max_jump').get_parameter_value().double_value
         self.field_width_meter = self.get_parameter(
             'field_width_meter').get_parameter_value().double_value
         self.field_height_meter = self.get_parameter(
@@ -866,6 +882,10 @@ class ToioNode(Node):
         pos_x, pos_y, q_x, q_y, q_z, q_w = self.convert_toio_to_ros_coord(
             info.center.point.x, info.center.point.y, info.center.angle)
 
+        if self._is_pose_outlier(
+                info.center.point.x, info.center.point.y, pos_x, pos_y):
+            return
+
         # kept for the dock action feedback, which runs on another thread
         self._last_pose_xy = (pos_x, pos_y)
 
@@ -885,6 +905,54 @@ class ToioNode(Node):
         # send the transformation
         toio_transform = self.make_toio_transform(pos_x, pos_y, q_x, q_y, q_z, q_w)
         self.tf_broadcaster.sendTransform(toio_transform)
+
+    # Position ID units a sample may lie outside the field before it is
+    # treated as impossible (the printed ID area ends at the field limits)
+    FIELD_TOLERANCE = 5.0
+
+    def _is_pose_outlier(self, id_x, id_y, pos_x, pos_y) -> bool:
+        """
+        Decide whether a Position ID sample is a read glitch (issue #59).
+
+        Off-field samples are dropped outright. A sample that jumps more
+        than pose_outlier_max_jump from the last accepted one is held back:
+        it is published only if the following sample confirms it, so a cube
+        that was picked up and put down elsewhere re-syncs after one sample
+        while a single bad read never reaches the pose topic.
+        """
+        if (id_x < self.field_min_x - self.FIELD_TOLERANCE
+                or id_x > self.field_max_x + self.FIELD_TOLERANCE
+                or id_y < self.field_min_y - self.FIELD_TOLERANCE
+                or id_y > self.field_max_y + self.FIELD_TOLERANCE):
+            self.get_logger().warn(
+                f'dropped Position ID ({id_x}, {id_y}): outside the mat field',
+                throttle_duration_sec=5.0)
+            return True
+
+        max_jump = self.pose_outlier_max_jump
+        now = time.monotonic()
+        if max_jump > 0 and self._last_accepted_xy is not None:
+            last_x, last_y = self._last_accepted_xy
+            jump = math.hypot(pos_x - last_x, pos_y - last_y)
+            if jump > max_jump:
+                held = self._held_back_xy
+                if held is not None and math.hypot(
+                        pos_x - held[0], pos_y - held[1]) <= max_jump:
+                    # Second sample at the new place: the move is real
+                    self._held_back_xy = None
+                else:
+                    self._held_back_xy = (pos_x, pos_y)
+                    self.get_logger().warn(
+                        f'held back Position ID sample ({pos_x:.3f}, '
+                        f'{pos_y:.3f}): {jump * 1000:.0f} mm from the last '
+                        f'accepted pose, waiting for the next sample',
+                        throttle_duration_sec=5.0)
+                    return True
+            else:
+                self._held_back_xy = None
+        self._last_accepted_xy = (pos_x, pos_y)
+        self._last_accepted_at = now
+        return False
 
     @staticmethod
     def compose_map_to_odom(map_pose, odom_pose):
@@ -1162,6 +1230,11 @@ class ToioNode(Node):
 
     def set_position_id_missed(self, missed: bool) -> None:
         """Update the Position ID missed state, publishing it when it changes."""
+        if missed:
+            # Nothing is known about where the cube goes while it is off the
+            # mat: trust the first sample after it is read again
+            self._last_accepted_xy = None
+            self._held_back_xy = None
         if missed == self._position_id_missed:
             return
         self._position_id_missed = missed
